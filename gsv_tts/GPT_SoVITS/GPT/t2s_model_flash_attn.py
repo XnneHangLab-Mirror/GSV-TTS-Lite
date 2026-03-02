@@ -355,13 +355,15 @@ class Text2SemanticDecoder(nn.Module):
         xy_pos, prompt_attn_mask = self.process_single_data(x, y, bert_feature)
 
         buckets = self.cuda_graph_buckets[1] # B = 1
-        bucket_i = 0
+        for bucket_i in range(len(buckets)):
+            if buckets[bucket_i].max_kv_cache > xy_pos.shape[1]:
+                break
         bucket: Bucket = buckets[bucket_i]
-        last_bucket: Bucket = buckets[-1]
+        max_bucket: Bucket = buckets[-1]
 
-        last_bucket.kv_cache_len.fill_(0)
-        last_bucket.k_cache.fill_(0)
-        last_bucket.v_cache.fill_(0)
+        max_bucket.kv_cache_len.fill_(0)
+        max_bucket.k_cache.fill_(0)
+        max_bucket.v_cache.fill_(0)
 
         pe_cache = self.ar_audio_position.alpha * self.ar_audio_position.pe
         pe_cache = pe_cache.transpose(0, 1)
@@ -375,7 +377,7 @@ class Text2SemanticDecoder(nn.Module):
         y_emb = self.ar_audio_embedding(samples)
         xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len]
         
-        for idx in tqdm(range(1, last_bucket.max_kv_cache - bucket.kv_cache_len + 1)):
+        for idx in tqdm(range(1, max_bucket.max_kv_cache - bucket.kv_cache_len + 1)):
             if bucket.kv_cache_len == bucket.max_kv_cache:
                 bucket_i += 1
                 bucket: Bucket = buckets[bucket_i]
@@ -417,13 +419,15 @@ class Text2SemanticDecoder(nn.Module):
         xy_pos, prompt_attn_mask = self.process_single_data(x, y, bert_feature)
 
         buckets = self.cuda_graph_buckets[1] # B = 1
-        bucket_i = 0
+        for bucket_i in range(len(buckets)):
+            if buckets[bucket_i].max_kv_cache > xy_pos.shape[1]:
+                break
         bucket: Bucket = buckets[bucket_i]
-        last_bucket: Bucket = buckets[-1]
+        max_bucket: Bucket = buckets[-1]
 
-        last_bucket.kv_cache_len.fill_(0)
-        last_bucket.k_cache.fill_(0)
-        last_bucket.v_cache.fill_(0)
+        max_bucket.kv_cache_len.fill_(0)
+        max_bucket.k_cache.fill_(0)
+        max_bucket.v_cache.fill_(0)
 
         pe_cache = self.ar_audio_position.alpha * self.ar_audio_position.pe
         pe_cache = pe_cache.transpose(0, 1)
@@ -439,7 +443,7 @@ class Text2SemanticDecoder(nn.Module):
         
         first_chunk = True
         pre_chunk = None
-        for idx in tqdm(range(1, last_bucket.max_kv_cache - bucket.kv_cache_len + 1), disable=not debug):
+        for idx in tqdm(range(1, max_bucket.max_kv_cache - bucket.kv_cache_len + 1), disable=not debug):
             if bucket.kv_cache_len == bucket.max_kv_cache:
                 bucket_i += 1
                 bucket: Bucket = buckets[bucket_i]
@@ -488,21 +492,12 @@ class Text2SemanticDecoder(nn.Module):
     ):
         B, device = len(x), x[0].device
         
-        batch_size = 0
-        for b in self.cuda_graph_buckets:
-            if b <= B and b > batch_size:
-                batch_size = b
-        
-        buckets = self.cuda_graph_buckets[batch_size]
-        bucket_i = 0
-        bucket: Bucket = buckets[bucket_i]
-        last_bucket: Bucket = buckets[-1]
-            
-        last_bucket.kv_cache_len.fill_(0)
-        last_bucket.k_cache.fill_(0)
-        last_bucket.v_cache.fill_(0)
+        for batch_size in sorted(self.cuda_graph_buckets):
+            if batch_size >= B:
+                break
 
         batch_indices = torch.arange(batch_size, dtype=torch.int64, device=device)
+        actual_batch_size = min(B, batch_size)
         
         batch_x = pad_sequence(x[:batch_size], batch_first=True, padding_value=0)
         batch_y = pad_sequence(y[:batch_size], batch_first=True, padding_value=0)
@@ -519,24 +514,36 @@ class Text2SemanticDecoder(nn.Module):
             y_lens.unsqueeze(1),
         )
 
-        current_batch = batch_size
+        buckets = self.cuda_graph_buckets[batch_size]
+        for bucket_i in range(len(buckets)):
+            if buckets[bucket_i].max_kv_cache > xy_pos.shape[1]:
+                break
+        bucket: Bucket = buckets[bucket_i]
+        max_bucket: Bucket = buckets[-1]
+            
+        max_bucket.kv_cache_len.fill_(0)
+        max_bucket.k_cache.fill_(0)
+        max_bucket.v_cache.fill_(0)
+
+        current_batch = actual_batch_size
 
         pe_cache = self.ar_audio_position.alpha * self.ar_audio_position.pe
         pe_cache = pe_cache.transpose(0, 1)
 
-        pre_tokens = torch.zeros((batch_size, last_bucket.max_kv_cache), dtype=torch.int64, device=device)
-        pre_tokens[:, :y_lens.max()] = batch_y
+        pre_tokens = torch.zeros((batch_size, max_bucket.max_kv_cache), dtype=torch.int64, device=device)
+        pre_tokens[:actual_batch_size, :y_lens.max()] = batch_y
 
 
-        xy_dec = self.t2s_transformer.process_prompt(xy_pos, bucket.k_cache, bucket.v_cache, bucket.kv_cache_len, prompt_attn_mask)
+        xy_dec = self.t2s_transformer.process_prompt(xy_pos, bucket.k_cache[:, :actual_batch_size], bucket.v_cache[:, :actual_batch_size], bucket.kv_cache_len[:actual_batch_size], prompt_attn_mask)
         logits = self.ar_predict_layer(xy_dec[:, -1])
 
-        bucket.kv_cache_len.copy_(xy_lens)
+        bucket.kv_cache_len[:actual_batch_size].copy_(xy_lens)
 
-        samples = sample(logits[:, :-1], pre_tokens, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
-        pre_tokens[batch_indices, bucket.kv_cache_len] = samples.squeeze()
+        samples = sample(logits[:, :-1], pre_tokens[:actual_batch_size], top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
+        pre_tokens[batch_indices, bucket.kv_cache_len][:actual_batch_size] = samples.squeeze()
         y_emb = self.ar_audio_embedding(samples)
-        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len]
+        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len][:actual_batch_size]
+        xy_pos = F.pad(xy_pos, (0, 0, 0, 0, 0, batch_size - actual_batch_size))
         
 
         stop = False
@@ -544,7 +551,8 @@ class Text2SemanticDecoder(nn.Module):
         semantic_orig_idx = []
         batch_orig_idx = torch.linspace(0, batch_size-1, batch_size, dtype=torch.int64, device=device)
         decode_steps = torch.zeros(batch_size, dtype=torch.int64, device=device)
-        ignore_batch = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        ignore_batch = torch.ones(batch_size, dtype=torch.bool, device=device)
+        ignore_batch[:actual_batch_size] = False
         while True:
             for idx in tqdm(range(1000)):
                 decode_steps += 1
