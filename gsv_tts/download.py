@@ -7,6 +7,11 @@ from tqdm import tqdm
 from pathlib import Path
 
 
+base_url = None
+modelscope_base_url = "https://modelscope.cn/models/chinokiki/GPTSoVITS-RT/resolve/master/%s"
+huggingface_base_url = "https://huggingface.co/cnmds/GPTSoVITS-RT/resolve/main/%s?download=true"
+
+
 def download_file(url, filename):
     logging.info(f"Downloading model from {url}")
 
@@ -64,32 +69,30 @@ def get_base_url():
     
     if ms_ok and not hf_ok:
         logging.info("Selected ModelScope.")
-        return "https://modelscope.cn/models/chinokiki/GPTSoVITS-RT/resolve/master/"
+        return modelscope_base_url
         
     if hf_ok and not ms_ok:
         logging.info("Selected Hugging Face.")
-        return "https://huggingface.co/cnmds/GPTSoVITS-RT/resolve/main/"
+        return huggingface_base_url
     
     if not hf_ok and not ms_ok:
         logging.error("Both Hugging Face and ModelScope are unreachable. Defaulting to Hugging Face.")
-        return "https://huggingface.co/cnmds/GPTSoVITS-RT/resolve/main/"
+        return huggingface_base_url
 
     if ms_latency < hf_latency:
         logging.info("Selected ModelScope.")
-        return "https://modelscope.cn/models/chinokiki/GPTSoVITS-RT/resolve/master/"
+        return modelscope_base_url
     else:
         logging.info("Selected Hugging Face.")
-        return "https://huggingface.co/cnmds/GPTSoVITS-RT/resolve/main/"
+        return huggingface_base_url
 
-base_url = None
-def download_model(filename, zip_filename):
-    global base_url
-    if base_url is None:
-        base_url = get_base_url()
-    if base_url == "https://modelscope.cn/models/chinokiki/GPTSoVITS-RT/resolve/master/":
-        url = base_url + filename
-    elif base_url == "https://huggingface.co/cnmds/GPTSoVITS-RT/resolve/main/":
-        url = base_url + filename + "?download=true"
+
+def download_model(filename, dir, download_url=None):
+    if download_url is None:
+        download_url = base_url
+        
+    url = download_url % (filename)
+    zip_filename = Path(dir) / filename
 
     download_file(url, zip_filename)
     unzip_file(zip_filename, os.path.dirname(zip_filename))
@@ -110,8 +113,28 @@ def check_pretrained_models(models_dir):
             break
     
     if is_download:
+        global base_url
+        if base_url is None:
+            base_url = get_base_url()
+
         os.makedirs(models_dir, exist_ok=True)
-        download_model(
-            filename="pretrained_models4.zip",
-            zip_filename=Path(models_dir) / "pretrained_models4.zip"
-        )
+
+        if base_url == modelscope_base_url:
+            download_model(
+                download_url=base_url,
+                filename="pretrained_models4.zip",
+                dir=models_dir,
+            )
+
+        elif base_url == huggingface_base_url:
+            download_model(
+                download_url=base_url,
+                filename="pretrained_models5.zip",
+                dir=models_dir,
+            )
+
+            download_model(
+                download_url="https://github.com/chinokikiss/GSV-TTS-Lite/releases/download/g2p/%s",
+                filename="g2p.zip",
+                dir=models_dir,
+            )

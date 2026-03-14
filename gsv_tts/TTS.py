@@ -93,7 +93,7 @@ class TTS:
         if use_bert and not os.path.exists(self.cnroberta_path):
             download_model(
                 filename="chinese-roberta.zip",
-                zip_filename=Path(self.models_dir) / "chinese-roberta-wwm-ext-large.zip"
+                dir=self.models_dir,
             )
 
         if use_bert: self.tts_config.cnroberta = CNRoberta(self.cnroberta_path, self.tts_config)
