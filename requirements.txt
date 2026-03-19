@@ -31,3 +31,4 @@ jieba
 
 # ja
 pyopenjtalk-plus
+inflect
