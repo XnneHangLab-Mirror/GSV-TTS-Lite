@@ -110,7 +110,17 @@ pip install torch torchvision torchaudio
 pip install gsv-tts-lite==0.3.7
 ```
 
-### 快速使用
+### WebUI
+1. **安装依赖**：
+  ```bash
+  pip install -r WebUI/requirements.txt
+  ```
+2. **启动程序**：
+  ```bash
+  python WebUI/web.py
+  ```
+
+### Python调用
 
 > [!TIP]
 > 首次运行时，程序会自动下载所需的预训练模型。
