@@ -89,6 +89,10 @@ def get_base_url():
 
 def download_model(filename, dir, download_url=None):
     if download_url is None:
+        global base_url
+        if base_url is None:
+            base_url = get_base_url()
+            
         download_url = base_url
         
     url = download_url % (filename)
