@@ -19,7 +19,7 @@ def cut_text(text, cut_minlen=10):
     sentences = seg.segment(text)
     
     text_cuts = []
-    punds_pattern = r'([，,；;：:、~・]|[\.]{2,}|…+)'
+    punds_pattern = r'([，,；;：:、~・…!！?？.]+)'
 
     clauses = []
     for sentence in sentences:

@@ -201,9 +201,12 @@ class Text2SemanticDecoder(nn.Module):
         self.cuda_graph_buckets = {}
     
     @torch.inference_mode()
-    def warmup(self, dtype, device, gpt_cache):
+    def warmup(self, dtype, device, gpt_cache, compile_mode):
         self.ar_text_position.extend_pe(torch.tensor(0.0, dtype=dtype, device=device).expand(1, 4000))
         self.ar_audio_position.extend_pe(torch.tensor(0.0, dtype=dtype, device=device).expand(1, 4000))
+
+        if compile_mode == "max-optimized":
+            self.t2s_transformer.process_prompt = torch.compile(self.t2s_transformer.process_prompt, mode="default", dynamic=True, fullgraph=True)
 
         for batch_size, max_kv_cache in gpt_cache:
             if batch_size in self.cuda_graph_buckets:
@@ -393,7 +396,7 @@ class Text2SemanticDecoder(nn.Module):
         samples = sample(logits[:, :-1], pre_tokens, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
         pre_tokens = torch.concat([pre_tokens, samples], dim=1)
         y_emb = self.ar_audio_embedding(samples)
-        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len]
+        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x.shape[1]]
         
         for idx in tqdm(range(1, max_bucket.max_kv_cache - bucket.kv_cache_len + 1)):
             if bucket.kv_cache_len == bucket.max_kv_cache:
@@ -424,7 +427,7 @@ class Text2SemanticDecoder(nn.Module):
             pre_tokens = torch.concat([pre_tokens, samples], dim=1)
 
             y_emb = self.ar_audio_embedding(samples)
-            xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len]
+            xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x.shape[1]]
 
         return pre_tokens[:, -idx:].unsqueeze(0)
         
@@ -467,7 +470,7 @@ class Text2SemanticDecoder(nn.Module):
         samples = sample(logits[:, :-1], pre_tokens, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
         pre_tokens = torch.concat([pre_tokens, samples], dim=1)
         y_emb = self.ar_audio_embedding(samples)
-        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len]
+        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x.shape[1]]
         
         first_chunk = True
         pre_chunk = None
@@ -511,7 +514,7 @@ class Text2SemanticDecoder(nn.Module):
                         pre_chunk = None
 
             y_emb = self.ar_audio_embedding(samples)
-            xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len]
+            xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x.shape[1]]
 
         yield pre_tokens[:, -idx:].unsqueeze(0), True
     
@@ -569,7 +572,7 @@ class Text2SemanticDecoder(nn.Module):
         pre_tokens = torch.zeros((batch_size, max_bucket.max_kv_cache), dtype=torch.int64, device=device)
         pre_tokens[:actual_batch_size, :y_lens.max()] = batch_y
 
-
+        # prefill
         xy_dec = self.t2s_transformer.process_prompt(xy_pos, bucket.k_cache[:, :actual_batch_size], bucket.v_cache[:, :actual_batch_size], bucket.kv_cache_len[:actual_batch_size], prompt_attn_mask)
         logits = self.ar_predict_layer(xy_dec[last_token_mask])
 
@@ -578,8 +581,9 @@ class Text2SemanticDecoder(nn.Module):
         samples = sample(logits[:, :-1], pre_tokens[:actual_batch_size], pre_tokens_lens=bucket.kv_cache_len[:actual_batch_size], top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
         pre_tokens[batch_indices, bucket.kv_cache_len][:actual_batch_size] = samples.squeeze()
         y_emb = self.ar_audio_embedding(samples)
-        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len][:actual_batch_size]
+        xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len[:actual_batch_size]-x_lens]
         xy_pos = F.pad(xy_pos, (0, 0, 0, 0, 0, batch_size - actual_batch_size))
+        x_lens = F.pad(x_lens, (0, batch_size - actual_batch_size))
         
 
         stop = False
@@ -651,6 +655,7 @@ class Text2SemanticDecoder(nn.Module):
                             xy_dec = self.t2s_transformer.process_prompt(_xy_pos, bucket.k_cache[:, i:i+1], bucket.v_cache[:, i:i+1], bucket.kv_cache_len[i:i+1], prompt_attn_mask)
                             logits = self.ar_predict_layer(xy_dec[:, -1])
 
+                            x_lens[i].copy_(single_x.shape[0])
                             bucket.kv_cache_len[i].copy_(single_x.shape[0] + single_y.shape[0])
                             pre_tokens[i].fill_(0)
                             pre_tokens[i, :single_y.shape[0]] = single_y
@@ -666,7 +671,7 @@ class Text2SemanticDecoder(nn.Module):
                 
                 pre_tokens[batch_indices, bucket.kv_cache_len] = samples.squeeze()
                 y_emb = self.ar_audio_embedding(samples)
-                xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len]
+                xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x_lens]
             
             if stop:
                 break

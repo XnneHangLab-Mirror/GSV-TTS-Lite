@@ -2,11 +2,10 @@ import re
 import codecs
 import numpy as np
 from nltk import pos_tag
-from nltk.corpus import cmudict
 from nltk.tokenize import TweetTokenizer
 word_tokenize = TweetTokenizer().tokenize
 
-# averaged_perceptron_tagger and cmudict and punkt
+# averaged_perceptron_tagger and punkt
 
 from builtins import str as unicode
 import unicodedata
@@ -24,7 +23,7 @@ def construct_homograph_dictionary(models_dir):
 
 
 class G2p(object):
-    def __init__(self, models_dir):
+    def __init__(self, models_dir, cmu):
         super().__init__()
         self.graphemes = ["<pad>", "<unk>", "</s>"] + list("abcdefghijklmnopqrstuvwxyz")
         self.phonemes = ["<pad>", "<unk>", "<s>", "</s>"] + ['AA0', 'AA1', 'AA2', 'AE0', 'AE1', 'AE2', 'AH0', 'AH1', 'AH2', 'AO0',
@@ -42,7 +41,7 @@ class G2p(object):
         self.p2idx = {p: idx for idx, p in enumerate(self.phonemes)}
         self.idx2p = {idx: p for idx, p in enumerate(self.phonemes)}
 
-        self.cmu = cmudict.dict()
+        self.cmu = cmu
         self.load_variables(models_dir)
         self.homograph2features = construct_homograph_dictionary(models_dir)
 

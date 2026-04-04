@@ -16,28 +16,25 @@ class CNRoberta(nn.Module):
     
     def forward(self, texts: List[str], word2ph_list: List[List[int]]):
         with torch.no_grad():
-            sep = self.tokenizer.sep_token
-            combined_text = sep.join(texts)
-            
-            inputs = self.tokenizer(combined_text, return_tensors="pt").to(self.bert_model.device)
+            inputs = self.tokenizer(
+                texts, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True, 
+                max_length=512
+            ).to(self.bert_model.device)
             
             res = self.bert_model(**inputs, output_hidden_states=True)
-            hidden_states = res["hidden_states"][-3] 
-            input_ids = inputs["input_ids"][0]
-
-            special_tokens = {self.tokenizer.cls_token_id, self.tokenizer.sep_token_id, self.tokenizer.pad_token_id}
-            mask = [i for i, tid in enumerate(input_ids.tolist()) if tid not in special_tokens]
-            all_char_features = hidden_states[0, mask, :]
-
+            hidden_states = res["hidden_states"][-3]
+            
             batch_phone_features = []
-            current_pos = 0
             for i in range(len(texts)):
-                num_chars = len(word2ph_list[i])
-                char_feature = all_char_features[current_pos : current_pos + num_chars]
-                current_pos += num_chars
+                mask = inputs['attention_mask'][i] == 1
+                char_features = hidden_states[i][mask]
+                char_features = char_features[1:-1, :]
                 
-                repeats = torch.tensor(word2ph_list[i], device=char_feature.device)
-                phone_feature = torch.repeat_interleave(char_feature, repeats, dim=0)
+                repeats = torch.tensor(word2ph_list[i], device=char_features.device)
+                phone_feature = torch.repeat_interleave(char_features, repeats, dim=0)
                 
                 batch_phone_features.append(phone_feature)
 

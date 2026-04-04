@@ -71,6 +71,4 @@ def text_to_phonemes(text, language):
             word2ph["ph"].pop(w_idx)
             word2ph["word"].pop(w_idx)
     
-    norm_text = "".join(word2ph["word"])
-
     return phones, word2ph, norm_text

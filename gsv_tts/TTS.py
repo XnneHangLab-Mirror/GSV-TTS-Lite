@@ -39,6 +39,7 @@ class TTS:
     def __init__(
         self,
         gpt_cache: list[tuple[int, int]] = [(1, 512), (1, 1024), (4, 512), (4, 1024)],
+        sovits_cache: list[int] = [50],
         models_dir: str = None,
         device: str = None,
         is_half: bool = None,
@@ -55,13 +56,14 @@ class TTS:
 
         Args:
             gpt_cache (list[tuple[int, int]]): Static cache sizes for the GPT model's CUDA graph. Each tuple represents (batch_size, sequence_length).
+            sovits_cache (list[int]): Static cache sizes for the SoVITS model's CUDA graph.
             models_dir (str): The directory path containing the pretrained model files.
             device (str): The device to run the model on.
             is_half (bool): Whether to use half-precision (FP16) inference.
             compile_mode (Literal[None, "default-optimized", "max-optimized"]): Specifies the optimization mode for `torch.compile`. `triton` needs to be installed.
-                - None: Disable compilation (Eager mode).
-                - "default-optimized": Standard optimization to improve inference speed (SoVITS).
-                - "max-optimized": Not fully developed yet (GPT、SoVITS、BERT).
+                - None: Disable compilation.
+                - "default-optimized": Standard inference optimization for SoVITS.
+                - "max-optimized": Full-stack inference optimization for GPT, SoVITS.
             use_flash_attn (bool): Whether to enable Flash Attention for faster inference.
             use_bert (bool): Whether to use BERT for enhanced Chinese semantic understanding. If True, BERT is loaded at initialization.
             auto_bert (bool): Whether to automatically load BERT when Chinese text is detected. Only effective when use_bert=False. Default is True.
@@ -89,6 +91,7 @@ class TTS:
         self.tts_config.compile_mode = compile_mode
         self.tts_config.use_flash_attn = use_flash_attn
         self.tts_config.gpt_cache = gpt_cache
+        self.tts_config.sovits_cache = sovits_cache
 
         self.gpt_models: dict[str, Gpt] = {}
         self.sovits_models: dict[str, Sovits] = {}
@@ -178,7 +181,7 @@ class TTS:
             if self._contains_chinese(text):
                 self._ensure_bert_loaded()
             
-            if not self.check_pause(text):
+            if not self._check_pause(text):
                 text += "."
 
             if len(text) > 20:
@@ -232,7 +235,7 @@ class TTS:
             assign = self._viterbi_monotonic(attn)
             subtitles = self._get_subtitles(word2ph, assign, speed)
 
-            if not self.check_pause(subtitles[-1]['text']):
+            if not self._check_pause(subtitles[-1]['text']):
                 subtitles.append({
                     "text": word2ph['word'][-1],
                     "start_s": subtitles[-1]['end_s'],
@@ -267,8 +270,8 @@ class TTS:
         text: str,
         is_cut_text: bool = True,
         cut_minlen: int = 10,
-        cut_mute: int = 0.2,
-        cut_mute_scale_map: dict = {".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, "…": 1.5, ",": 0.8, "，": 0.8, ":": 0.8, "：": 0.8, ";": 0.8, "；": 0.8, "~": 0.8, "、": 0.6, "・": 0.6},
+        cut_mute: int = 0.3,
+        cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 0.8, "，": 0.8, ":": 0.8, "：": 0.8, ";": 0.8, "；": 0.8, "~": 0.8, "、": 0.6, "・": 0.6},
         stream_mode: Literal["token", "sentence"] = "token",
         stream_chunk: int = 25,
         overlap_len: int = 10,
@@ -324,7 +327,7 @@ class TTS:
             if self._contains_chinese(text):
                 self._ensure_bert_loaded()
             
-            if not self.check_pause(text):
+            if not self._check_pause(text):
                 text += "."
 
             if len(text) > 20:
@@ -418,13 +421,15 @@ class TTS:
                     if is_final:
                         if text_cut[-1] in cut_mute_scale_map:
                             cut_mute_scale = cut_mute_scale_map[text_cut[-1]]
+                        elif "…" in cut_mute_scale_map and text_cut[-3:] in ["...", "。。。"]:
+                            cut_mute_scale = cut_mute_scale_map["…"]
                         else:
                             cut_mute_scale = 1.0
 
                         silence = torch.zeros((int(cut_mute * cut_mute_scale * self.samplerate),), dtype=audio.dtype, device=audio.device)
                         audio = torch.concatenate([audio, silence])
 
-                        if not self.check_pause(subtitles[-1]['text']):
+                        if not self._check_pause(subtitles[-1]['text']):
                             subtitles.append({
                                 "text": word2ph['word'][-1],
                                 "start_s": subtitles[-1]['end_s'],
@@ -468,8 +473,8 @@ class TTS:
         return_subtitles: bool = False,
         is_cut_text: bool = True,
         cut_minlen: int = 10,
-        cut_mute: int = 0.2,
-        cut_mute_scale_map: dict = {".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, "…": 1.5, ",": 0.8, "，": 0.8, ":": 0.8, "：": 0.8, ";": 0.8, "；": 0.8, "~": 0.8, "、": 0.6, "・": 0.6},
+        cut_mute: int = 0.3,
+        cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 0.8, "，": 0.8, ":": 0.8, "：": 0.8, ";": 0.8, "；": 0.8, "~": 0.8, "、": 0.6, "・": 0.6},
         top_k: int = 15,
         top_p: float = 1.0,
         temperature: float = 1.0,
@@ -524,7 +529,7 @@ class TTS:
             if any(self._contains_chinese(t) for t in texts):
                 self._ensure_bert_loaded()
             
-            texts = [t if self.check_pause(t) else t + "." for t in texts]
+            texts = [t if self._check_pause(t) else t + "." for t in texts]
 
             if not is_cut_text: cut_minlen = 10000
 
@@ -722,7 +727,7 @@ class TTS:
                 # semantic [n_q, B, N]
 
                 audio_batch, attn = vq_model.decode(
-                    curr_semantic, curr_phones2, curr_ge, noise_scale=noise_scale, speed=speed, slice_indices=slice_indices
+                    curr_semantic, curr_phones2, curr_ge, noise_scale=noise_scale, speed=speed, cuda_graph=False, slice_indices=slice_indices
                 )
 
                 audio_batch = audio_batch[0, 0, :]
@@ -803,6 +808,8 @@ class TTS:
 
                 if texts[i][-1] in cut_mute_scale_map:
                     cut_mute_scale = cut_mute_scale_map[texts[i][-1]]
+                elif "…" in cut_mute_scale_map and texts[i][-3:] in ["...", "。。。"]:
+                    cut_mute_scale = cut_mute_scale_map["…"]
                 else:
                     cut_mute_scale = 1.0
                 silence = np.zeros((int(cut_mute * cut_mute_scale * self.samplerate),))
@@ -870,7 +877,7 @@ class TTS:
         """
 
         try:
-            if not self.check_pause(prompt_audio_text):
+            if not self._check_pause(prompt_audio_text):
                 prompt_audio_text += "."
 
             logging.info(f"Starting VC inference. Prompt audio: {prompt_audio_path}")
@@ -909,7 +916,7 @@ class TTS:
             assign = self._viterbi_monotonic(attn)
             subtitles = self._get_subtitles(word2ph, assign, speed)
             
-            if not self.check_pause(subtitles[-1]['text']):
+            if not self._check_pause(subtitles[-1]['text']):
                 subtitles.append({
                     "text": word2ph['word'][-1],
                     "start_s": subtitles[-1]['end_s'],
@@ -994,8 +1001,8 @@ class TTS:
         return_subtitles: bool = False,
         is_cut_text: bool = True,
         cut_minlen: int = 10,
-        cut_mute: int = 0.2,
-        cut_mute_scale_map: dict = {".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, "…": 1.5, ",": 0.8, "，": 0.8, ":": 0.8, "：": 0.8, ";": 0.8, "；": 0.8, "~": 0.8, "、": 0.6, "・": 0.6},
+        cut_mute: int = 0.3,
+        cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 0.8, "，": 0.8, ":": 0.8, "：": 0.8, ";": 0.8, "；": 0.8, "~": 0.8, "、": 0.6, "・": 0.6},
         top_k: int = 15,
         top_p: float = 1.0,
         temperature: float = 1.0,
@@ -1409,8 +1416,8 @@ class TTS:
         self._bert_loaded = True
         logging.info("BERT model loaded lazily for Chinese text")
     
-    def check_pause(self, text: str):
-        return text.endswith(self.punctuation) or text[-3:] == "..."
+    def _check_pause(self, text: str):
+        return text.endswith(self.punctuation) or text[-3:] in ["...", "。。。"]
     
     def _get_prompt(self, cnhubert_model: CNHubert, sovits_model: Sovits, audio_path: str):
         wav, sr = torchaudio.load(audio_path)
@@ -1493,7 +1500,7 @@ class TTS:
         
         return head_offset
     
-    def _find_head_threshold_offsets(self, audio, threshold=0.01, frame_length=512, hop_length=256, search_len=16000):
+    def _find_head_threshold_offsets(self, audio, threshold=0.02, frame_length=512, hop_length=256, search_len=32000):
         threshold = threshold * audio.max()
 
         search_audio_head = audio[:search_len]
@@ -1511,7 +1518,7 @@ class TTS:
             
         return head_offset
 
-    def _find_tail_threshold_offsets(self, audio, threshold=0.01, frame_length=512, hop_length=256, search_len=16000):
+    def _find_tail_threshold_offsets(self, audio, threshold=0.02, frame_length=512, hop_length=256, search_len=32000):
         threshold = threshold * audio.max()
 
         search_audio_tail = audio[-search_len:]

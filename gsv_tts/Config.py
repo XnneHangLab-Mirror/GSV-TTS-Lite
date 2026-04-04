@@ -94,6 +94,7 @@ class Config:
         self.use_flash_attn = False
 
         self.gpt_cache = None
+        self.sovits_cache = None
 
         self.compile_mode = None
 

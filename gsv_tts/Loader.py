@@ -50,7 +50,6 @@ def get_sovits_weights(sovits_path, tts_config: Config):
 
         with torch.device("meta"):
             vq_model = SynthesizerTrn(
-                tts_config.compile_mode,
                 hps.data.filter_length // 2 + 1,
                 hps.train.segment_size // hps.data.hop_length,
                 n_speakers=hps.data.n_speakers,
@@ -71,7 +70,6 @@ def get_sovits_weights(sovits_path, tts_config: Config):
         hps.model.semantic_frame_rate = "25hz"
         
         vq_model = SynthesizerTrn(
-            tts_config.compile_mode,
             hps.data.filter_length // 2 + 1,
             hps.train.segment_size // hps.data.hop_length,
             n_speakers=hps.data.n_speakers,
@@ -88,6 +86,7 @@ def get_sovits_weights(sovits_path, tts_config: Config):
             vq_model = vq_model.to(tts_config.device)
 
     vq_model.eval()
+    vq_model.warmup(tts_config.dtype, tts_config.device, tts_config.sovits_cache, tts_config.compile_mode)
 
     sovits = Sovits(vq_model, hps)
 
@@ -160,7 +159,7 @@ def get_gpt_weights(gpt_path, tts_config: Config):
             t2s_model = t2s_model.float().to(tts_config.device)
 
     t2s_model.eval()
-    t2s_model.warmup(tts_config.dtype, tts_config.device, tts_config.gpt_cache)
+    t2s_model.warmup(tts_config.dtype, tts_config.device, tts_config.gpt_cache, tts_config.compile_mode)
 
     gpt = Gpt(t2s_model, config)
 

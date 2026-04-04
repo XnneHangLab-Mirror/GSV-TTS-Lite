@@ -14,8 +14,6 @@ from pathlib import Path
 
 class EnglishG2P(G2p):
     def __init__(self, models_dir):
-        super().__init__(models_dir)
-
         self.word_tokenize = TweetTokenizer().tokenize
 
         self.CMU_DICT_PATH = Path(models_dir) / "g2p" / "en" / "cmudict.rep"
@@ -36,6 +34,8 @@ class EnglishG2P(G2p):
         # 剔除读音错误的几个缩写
         for word in ["AE", "AI", "AR", "IOS", "HUD", "OS"]:
             del self.cmu[word.lower()]
+
+        super().__init__(models_dir, self.cmu)
 
         # 修正多音字
         self.homograph2features["read"] = (["R", "IY1", "D"], ["R", "EH1", "D"], "VBP")
