@@ -141,8 +141,7 @@ pip install gsv-tts-lite==0.3.9
 ```python
 from gsv_tts import TTS
 
-tts = TTS()
-# tts = TTS(use_bert=True) 如果要获得更优的中文合成效果，建议这样设置
+tts = TTS(use_bert=True)
 # tts = TTS(use_flash_attn=True) 如果安装了Flash Attention，建议这样设置
 
 # 将 GPT 模型权重从指定路径加载到内存中，这里加载默认模型。
@@ -216,7 +215,7 @@ class SubtitlesQueue:
             self.t = threading.Thread(target=self.process, daemon=True)
             self.t.start()
 
-tts = TTS()
+tts = TTS(use_bert=True)
 
 # infer、infer_stream、infer_batched、infer_vc 其实都支持字幕时间戳的返回，这里只是通过 infer_stream 举个例子
 subtitlesqueue = SubtitlesQueue()
@@ -242,7 +241,7 @@ subtitlesqueue.add(None, None)
 ```python
 from gsv_tts import TTS
 
-tts = TTS()
+tts = TTS(use_bert=True)
 
 # infer_batched 专为长文本及多句合成场景优化。该模式不仅在处理效率上具有显著优势，更支持在同一批次（Batch）中为不同句子指定不同的参考音频，提供了极高的合成自由度与灵活性。
 audios = tts.infer_batched(
@@ -260,7 +259,7 @@ for i, audio in enumerate(audios):
 ```python
 from gsv_tts import TTS
 
-tts = TTS(always_load_cnhubert=True)
+tts = TTS(use_bert=True, always_load_cnhubert=True)
 
 # infer_vc 虽然支持 Few-shot（少样本）音色迁移，在便捷性上有一定优势，但在转换质量上，相较于 RVC、SVC 等专门的变声模型仍有提升空间。
 audio = tts.infer_vc(
@@ -277,7 +276,7 @@ tts.audio_queue.wait()
 ```python
 from gsv_tts import TTS
 
-tts = TTS(always_load_sv=True)
+tts = TTS(use_bert=True, always_load_sv=True)
 
 # verify_speaker 用于对比两段音频的说话人特征，判断其是否为同一人。
 similarity = tts.verify_speaker("examples\laffey.mp3", "examples\AnAn.ogg")
