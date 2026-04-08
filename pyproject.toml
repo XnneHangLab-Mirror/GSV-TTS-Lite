@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsv-tts-lite"
+version = "0.3.10"
+requires-python = ">=3.10"
+dependencies = [
+  "einops",
+  "future",
+  "inflect",
+  "jieba",
+  "nltk",
+  "numpy",
+  "onnxruntime",
+  "py3langid",
+  "pyopenjtalk-plus",
+  "pypinyin",
+  "pysbd",
+  "requests",
+  "safetensors",
+  "sounddevice",
+  "soundfile",
+  "tqdm",
+  "transformers",
+  "wordsegment",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gsv_tts*"]
