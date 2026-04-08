@@ -5,6 +5,14 @@ import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+
+def _load_audio(path: str) -> "tuple[torch.Tensor, int]":
+    """Load audio using soundfile (no FFmpeg/SoX subprocess required)."""
+    import soundfile as sf
+    data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    # soundfile returns (samples, channels); torchaudio convention is (channels, samples)
+    return torch.from_numpy(data.T.copy()), sr
+
 # 让 CUDA 算子同步执行，这样才能找到报错位置
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
@@ -1417,7 +1425,7 @@ class TTS:
         return text.endswith(self.punctuation) or text[-3:] in ["...", "。。。"]
     
     def _get_prompt(self, cnhubert_model: CNHubert, sovits_model: Sovits, audio_path: str):
-        wav, sr = torchaudio.load(audio_path)
+        wav, sr = _load_audio(audio_path)
         wav = wav.to(self.tts_config.device)
 
         wav16k = self._resample(wav, sr, 16000).mean(dim=0)
@@ -1444,7 +1452,7 @@ class TTS:
     
     def _get_spec(self, hps, filename):
         sr1 = int(hps.data.sampling_rate)
-        audio, sr0 = torchaudio.load(filename)
+        audio, sr0 = _load_audio(filename)
 
         audio = audio.to(self.tts_config.device).float()
         if audio.shape[0] == 2:
