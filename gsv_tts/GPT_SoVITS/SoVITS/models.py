@@ -17,6 +17,8 @@ from .module.quantize import ResidualVectorQuantizer
 
 from ..G2P import Symbols
 
+V2PRO_SET = {"v2Pro", "v2ProPlus"}
+
 
 class ResidualCouplingBlock(nn.Module):
     def __init__(
@@ -231,6 +233,7 @@ class Bucket:
     sovits_cache: int = None
 
 class SynthesizerTrn(nn.Module):
+
     def __init__(
         self,
         spec_channels,
@@ -250,8 +253,9 @@ class SynthesizerTrn(nn.Module):
         upsample_kernel_sizes,
         n_speakers=0,
         gin_channels=0,
-        semantic_frame_rate=None,
+        semantic_frame_rate="25hz",
         freeze_quantizer=None,
+        version="v2",
         **kwargs,
     ):
         super().__init__()
@@ -274,7 +278,9 @@ class SynthesizerTrn(nn.Module):
         self.gin_channels = gin_channels
         self.samples_per_frame = math.prod(self.upsample_rates)
         self.semantic_frame_rate = semantic_frame_rate
-        
+        self.version = version
+        self.is_v2pro = self.version in V2PRO_SET
+
         self.enc_p = TextEncoder(
             inter_channels,
             hidden_channels,
@@ -300,26 +306,25 @@ class SynthesizerTrn(nn.Module):
 
         ssl_dim = 768
 
+        # gsv_tts\Loader.py已经写死25hz了，暂定
         self.ssl_proj = nn.Conv1d(ssl_dim, ssl_dim, 2, stride=2)
 
         self.quantizer = ResidualVectorQuantizer(dimension=ssl_dim, n_q=1, bins=1024)
         self.freeze_quantizer = freeze_quantizer
 
-        self.sv_emb = nn.Linear(20480, gin_channels)
-        self.ge_to512 = nn.Linear(gin_channels, 512)
-        self.prelu = nn.PReLU(num_parameters=gin_channels)
-        
-        self.cuda_graph_buckets = {}
-    
+        if self.is_v2pro:
+            self.sv_emb = nn.Linear(20480, gin_channels)
+            self.ge_to512 = nn.Linear(gin_channels, 512)
+            self.prelu = nn.PReLU(num_parameters=gin_channels)
+
+        self.cuda_graph_buckets = []
+
     @torch.inference_mode()
-    def warmup(self, dtype, device, sovits_caches, compile_mode):
+    def initialize_runtime(self, dtype, device, sovits_caches):
         batch_size = 1
 
         # 检查是否使用 CUDA Graph（仅 CUDA 设备支持）
         use_cuda_graph = device.type == "cuda"
-
-        if compile_mode == "default-optimized" or compile_mode == "max-optimized":
-            self.flow_dec = torch.compile(self.flow_dec, mode="default", dynamic=True, fullgraph=True)
 
         if use_cuda_graph:
             s = torch.cuda.Stream()
@@ -329,15 +334,23 @@ class SynthesizerTrn(nn.Module):
             stream_context = torch.no_grad()
 
         with stream_context:
-            for sovits_cache in sovits_caches:
-                self.cuda_graph_buckets[(batch_size, sovits_cache)] = Bucket()
-                bucket: Bucket = self.cuda_graph_buckets[(batch_size, sovits_cache)]
+            sovits_caches = sorted(sovits_caches)
 
+            for i in range(-1, -len(sovits_caches)-1, -1):
+                sovits_cache = sovits_caches[i]
+                self.cuda_graph_buckets.insert(0, Bucket())
+                bucket: Bucket = self.cuda_graph_buckets[0]
                 bucket.sovits_cache = sovits_cache
 
-                bucket.flow_z_p_padded = torch.zeros((batch_size, self.enc_p.latent_channels, sovits_cache), dtype=dtype, device=device)
-                bucket.flow_y_mask_padded = torch.zeros((batch_size, 1, sovits_cache), dtype=dtype, device=device)
-                bucket.flow_ge = torch.zeros((batch_size, 1024, 1), dtype=dtype, device=device)
+                if i == -1:
+                    bucket.flow_z_p_padded = torch.zeros((batch_size, self.enc_p.latent_channels, sovits_cache), dtype=dtype, device=device)
+                    bucket.flow_y_mask_padded = torch.zeros((batch_size, 1, sovits_cache), dtype=dtype, device=device)
+                    bucket.flow_ge = torch.zeros((batch_size, self.gin_channels, 1), dtype=dtype, device=device)
+                else:
+                    max_bucket: Bucket = self.cuda_graph_buckets[-1]
+                    bucket.flow_z_p_padded = max_bucket.flow_z_p_padded[:, :, :sovits_cache]
+                    bucket.flow_y_mask_padded = max_bucket.flow_y_mask_padded[:, :, :sovits_cache]
+                    bucket.flow_ge = max_bucket.flow_ge
 
                 # 预热运行
                 for _ in range(3):
@@ -354,20 +367,21 @@ class SynthesizerTrn(nn.Module):
 
         if use_cuda_graph:
             torch.cuda.current_stream().wait_stream(s)
-    
-    def get_ge(self, refer, sv_emb):
+
+    def get_ge(self, refer, sv_emb=None):
         refer_mask = torch.ones((1, 1, refer.size(2)), dtype=refer.dtype, device=refer.device)
         ge = self.ref_enc(refer[:, :704] * refer_mask, refer_mask)
-        sv_emb = self.sv_emb(sv_emb)
-        ge += sv_emb.unsqueeze(-1)
-        ge = self.prelu(ge)
+        if self.is_v2pro and sv_emb is not None:
+            sv_emb = self.sv_emb(sv_emb)
+            ge += sv_emb.unsqueeze(-1)
+            ge = self.prelu(ge)
         return ge
 
     def flow_dec(self, z_p, y_mask, ge):
         z = self.flow(z_p, y_mask, ge)
         o = self.dec(z * y_mask, g=ge)
         return o
-    
+
     @torch.inference_mode()
     def decode(self, codes, text, ge, noise_scale=0.5, speed=1, cuda_graph=True, stream_mode=False, valid_start_idx=None, overlap_len=None, slice_indices=None):
         quantized = self.quantizer.decode(codes)
@@ -377,7 +391,7 @@ class SynthesizerTrn(nn.Module):
         m_p, logs_p, y_mask = self.enc_p.infer(
             quantized,
             text,
-            self.ge_to512(ge.transpose(2, 1)).transpose(2, 1),
+            self.ge_to512(ge.transpose(2, 1)).transpose(2, 1) if self.is_v2pro else ge,
             speed,
             stream_mode,
             valid_start_idx,
@@ -391,9 +405,9 @@ class SynthesizerTrn(nn.Module):
 
         if cuda_graph:
             z_current_length = z_p.size(-1)
-            for (batch_size, z_max_length) in self.cuda_graph_buckets:
-                if batch_size == 1 and z_max_length >= z_current_length:
-                    bucket: Bucket = self.cuda_graph_buckets[(batch_size, z_max_length)]
+            for bucket in self.cuda_graph_buckets:
+                bucket: Bucket = bucket
+                if bucket.sovits_cache >= z_current_length:
                     break
             else:
                 bucket = None
@@ -401,20 +415,17 @@ class SynthesizerTrn(nn.Module):
             bucket = None
 
         if bucket and bucket.vits_cuda_graph is not None:
-            z_p_padded = F.pad(z_p, (0, z_max_length-z_current_length), value=0.0)
-            y_mask_padded = F.pad(y_mask, (0, z_max_length-z_current_length), value=0.0)
-
-            bucket.flow_z_p_padded.copy_(z_p_padded)
-            bucket.flow_y_mask_padded.copy_(y_mask_padded)
+            bucket.flow_z_p_padded[..., :z_current_length].copy_(z_p)
+            bucket.flow_y_mask_padded[..., :z_current_length].copy_(y_mask)
             bucket.flow_ge.copy_(ge)
 
             bucket.vits_cuda_graph.replay()
             o = bucket.dec_o[:, :, :z_current_length * self.samples_per_frame]
         else:
             o = self.flow_dec(z_p, y_mask, ge)
-        
+
         attn = self.enc_p.mrte.cross_attention.attn
-            
+
         return o, attn[0, ...]
 
     def extract_latent(self, x):

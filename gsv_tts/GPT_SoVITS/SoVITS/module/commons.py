@@ -1,5 +1,4 @@
 import torch
-from torch.nn import functional as F
 
 
 def init_weights(m, mean=0.0, std=0.01):
@@ -13,11 +12,11 @@ def get_padding(kernel_size, dilation=1):
 
 
 @torch.jit.script
-def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
-    n_channels_int = n_channels[0]
+def fused_add_tanh_sigmoid_multiply(input_a, input_b):
     in_act = input_a + input_b
-    t_act = torch.tanh(in_act[:, :n_channels_int, :])
-    s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
+    t_act_raw, s_act_raw = torch.chunk(in_act, 2, dim=1)
+    t_act = torch.tanh(t_act_raw)
+    s_act = torch.sigmoid(s_act_raw)
     acts = t_act * s_act
     return acts
 
@@ -26,15 +25,3 @@ def convert_pad_shape(pad_shape):
     l = pad_shape[::-1]
     pad_shape = [item for sublist in l for item in sublist]
     return pad_shape
-
-
-def shift_1d(x):
-    x = F.pad(x, convert_pad_shape([[0, 0], [0, 0], [1, 0]]))[:, :, :-1]
-    return x
-
-
-def sequence_mask(length, max_length=None):
-    if max_length is None:
-        max_length = length.max()
-    x = torch.arange(max_length, dtype=length.dtype, device=length.device)
-    return x.unsqueeze(0) < length.unsqueeze(1)

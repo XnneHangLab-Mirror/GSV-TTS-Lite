@@ -19,6 +19,12 @@
       <a href="https://github.com/chinokikiss/GSV-TTS-Lite/stargazers">
         <img src="https://img.shields.io/github/stars/chinokikiss/GSV-TTS-Lite?style=for-the-badge&color=yellow&logo=github" alt="GitHub stars">
       </a>
+      <a href="https://pepy.tech/project/gsv-tts-lite">
+        <img src="https://img.shields.io/pepy/dt/gsv-tts-lite?style=for-the-badge&color=brightgreen" alt="Downloads">
+      </a>
+      <a href="https://deepwiki.com/chinokikiss/GSV-TTS-Lite">
+        <img src="https://img.shields.io/badge/Documentation-DeepWiki-blueviolet.svg?style=for-the-badge&logo=gitbook" alt="Documentation">
+      </a>
   </p>
 
   <p>
@@ -44,13 +50,13 @@
 
 本プロジェクトは、極限までのパフォーマンス追求を初衷として誕生しました。原版 GPT-SoVITS の使用中、RTX 3050 (Laptop) の計算能力のボトルネックにより、推論遅延がリアルタイム交互のニーズを満たすことが難しい場合がありました。
 
-この制限を打破するため、**GSV-TTS-Lite** が生まれました。これは **GPT-SoVITS V2Pro** に基づいて開発された推論バックエンドです。いくつかの深層最適化技術により、本プロジェクトは低 VRAM 環境においてミリ秒級のリアルタイム応答を実現しました。
+この制限を打破するため、**GSV-TTS-Lite** が生まれました。これは **GPT-SoVITS (V2/V2Pro/V2ProPlus)** に基づいて開発された推論バックエンドです。いくつかの深層最適化技術により、本プロジェクトは低 VRAM 環境においてミリ秒級のリアルタイム応答を実現しました。
 
-パフォーマンスの飛躍に加え、**GSV-TTS-Lite** は**音色とスタイルの分離**を実現し、話者の音色と感情を独立して制御可能にしました。さらに、**字幕タイムスタンプ同期**や**音色変換**などの特有機能を追加しました。
+パフォーマンスの飛躍に加え、**GSV-TTS-Lite** は**音色とスタイルの分離**を実現し、話者の音色と感情を独立して制御可能にしました。さらに、**文字単位のタイムスタンプ同期**や**音色変換**などの特有機能を追加しました。
 
 開発者の統合を容易にするため、**GSV-TTS-Lite** はコードアーキテクチャを大幅に簡素化し、`gsv-tts-lite` ライブラリとして PyPI に公開されました。`pip` によるワンクリックインストールをサポートしています。
 
-現在サポートされている言語は**中国語、日本語、英語**で、サポートされているモデルは **V2Pro**、**V2ProPlus** です。
+現在サポートされている言語は**中国語、日本語、英語**で、サポートされているモデルは **V2**、**V2Pro**、**V2ProPlus** です。
 ## パフォーマンス比較 (Performance)
 
 > [!NOTE]
@@ -63,13 +69,21 @@
 | **Lite Version** | `Flash_Attn=On` | **133 ms** | **0.108** | **0.8 GB** | 🔥 **3.3x** 速度 |
 
 ご覧の通り、**GSV-TTS-Lite** は **3x ~ 4x** の速度向上を実現し、VRAM 占有量も**半分**になりました！🚀
+
+| GPU Model | Throughput (tok/s) | FlashAttention2 |
+| :--- | :---: | :---: |
+| **RTX-PRO-6000** | 1122.72 | Enable |
+| **H200** | 886.47 | Enable |
+| **A100** | 660.73 | Enable |
+| **T4** | 281.06 | Disabled |
+
+**Core optimization technologies:** CUDA Graph, Nested KV Cache, and Continuous Batching.
 <br>
 
 ## 開発者向けデプロイ (Deployment)
 
 ### 環境準備
 
-- **FFmpeg**
 - **CUDA Toolkit**
 > [!IMPORTANT]
 > 現在のバージョンでは、CUDA、MPS (Apple Silicon)、および CPU 推論バックエンドを全面的にサポートしています。
@@ -89,7 +103,7 @@ pip install torch torchvision torchaudio
 #### 2. GSV-TTS-Lite のインストール
 上記の基本環境が準備できれば、以下のコマンドを実行するだけで統合が完了します：
 ```bash 
-pip install gsv-tts-lite==0.3.10
+pip install gsv-tts-lite==0.4.1
 ```
 
 ### WebUI 可視化インターフェース
@@ -155,6 +169,7 @@ audio.play()
 tts.audio_queue.wait()
 # tts.audio_queue.stop() 再生を停止
 ```
+https://github.com/user-attachments/assets/72635b40-7287-4318-a5e9-aea93adfabf9
 
 #### 2. ストリーミング推論 / 字幕同期
 ```python
@@ -180,15 +195,13 @@ class SubtitlesQueue:
 
             for subtitle in subtitles:
                 if subtitle["start_s"] > time.time() - last_t:
-                    while time.time() - last_t <= subtitle["start_s"]:
-                        time.sleep(0.01)
+                    time.sleep(subtitle["start_s"] - (time.time() - last_t))
 
                 if subtitle["end_s"] and subtitle["end_s"] > time.time() - last_t:
                     if subtitle["orig_idx_end"] > last_i:
                         print(text[last_i:subtitle["orig_idx_end"]], end="", flush=True)
                         last_i = subtitle["orig_idx_end"]
-                        while time.time() - last_t <= subtitle["end_s"]:
-                            time.sleep(0.01)
+                        time.sleep(subtitle["end_s"] - (time.time() - last_t))
 
         self.t = None
     
@@ -198,9 +211,9 @@ class SubtitlesQueue:
             self.t = threading.Thread(target=self.process, daemon=True)
             self.t.start()
 
-tts = TTS()
+tts = TTS(sovits_cache=[50, 55]) # 50 = stream_chunk * 2 = 25 * 2, 55 = stream_chunk * 2 + overlap_len = 25 * 2 + 5
 
-# infer、infer_stream、infer_batched、infer_vc は実際すべて字幕タイムスタンプの返却をサポートしていますが、ここでは infer_stream を例に挙げています
+# infer、infer_stream、infer_batched、infer_vc は実際すべて文字単位のタイムスタンプの返却をサポートしていますが、ここでは infer_stream を例に挙げています
 subtitlesqueue = SubtitlesQueue()
 
 # infer_stream は Token レベルのストリーミング出力を実装し、初字遅延を大幅に低減し、极低遅延のリアルタイムフィードバック体験を実現します。
@@ -209,6 +222,9 @@ generator = tts.infer_stream(
     prompt_audio_path="examples\AnAn.ogg",
     prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。",
     text="へぇー、ここまでしてくれるんですね。",
+    stream_chunk = 25,
+    overlap_len = 5,
+    return_subtitles=True,
     debug=False,
 )
 
@@ -219,10 +235,18 @@ for audio in generator:
 tts.audio_queue.wait()
 subtitlesqueue.add(None, None)
 ```
+https://github.com/user-attachments/assets/3d2758b3-a283-48b0-960e-a9389dd73129
 
 #### 3. バッチ推論
 ```python
 from gsv_tts import TTS
+
+# TTSクラスの引数 gpt_cache: GPTモデルのCUDAグラフ用静的キャッシュ設定。
+    # 設定値はタプルのリスト [(batch_size, sequence_length), ...] です。
+    # 必要に応じてbatchとsequence_lengthを細分化して定義することで、CUDAメモリ使用効率と推論パフォーマンスを最適化できます。
+    # 注意:
+    # 1. 設定した最大 batch_size は、バッチ処理における最大スループットを決定します。
+    # 2. 指定したバッチ内の最大 sequence_length は、一度に生成可能な最大テキスト長を決定します。
 
 tts = TTS()
 
@@ -232,11 +256,14 @@ audios = tts.infer_batched(
     prompt_audio_paths="examples\AnAn.ogg",
     prompt_audio_texts="ちが……ちがう。レイア、貴様は間違っている。",
     texts=["へぇー、ここまでしてくれるんですね。", "The old map crinkled in Leo's trembling hands."],
+    bert_batch_size=20,
+    sovits_batch_size=10,
 )
 
 for i, audio in enumerate(audios):
     audio.save(f"audio{i}.wav")
 ```
+https://github.com/user-attachments/assets/c2edeb24-b2a8-4360-9d68-8866efbed30c
 
 #### 4. 音色変換
 ```python
@@ -244,7 +271,7 @@ from gsv_tts import TTS
 
 tts = TTS(always_load_cnhubert=True)
 
-# infer_vc は Few-shot（少数サンプル）音色変換をサポートしていますが、利便性において一定の優位性があるものの、変換品質においては RVC、SVC などの専用変声モデルと比較するとまだ向上の余地があります。
+# infer_vc は Zero-shot 音色変換をサポートしていますが、利便性において一定の優位性があるものの、変換品質においては RVC、SVC などの専用変声モデルと比較するとまだ向上の余地があります。
 audio = tts.infer_vc(
     spk_audio_path="examples\laffey.mp3",
     prompt_audio_path="examples\AnAn.ogg",
@@ -302,6 +329,17 @@ PyTorch 形式のモデル重みファイル（.pth または .ckpt）を safete
 
 #### `get_spk_audio_list()` / `get_prompt_audio_list()`
 キャッシュ内のオーディオデータリストを取得します。
+
+### 3. 非同期呼び出し
+
+#### `infer_async(...)`
+`infer` メソッドの非同期バージョン。
+
+#### `infer_stream_async(...)`
+`infer_stream` メソッドの非同期バージョン。
+
+#### `infer_batched_async(...)`
+`infer_batched` メソッドの非同期バージョン。
 
 </details>
 

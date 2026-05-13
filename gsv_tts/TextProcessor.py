@@ -18,13 +18,14 @@ def get_semantic_length(text, en_weight=1.75):
 def cut_text(text, cut_minlen=10):
     sentences = seg.segment(text)
 
-    for i in range(1, len(sentences)):
-        if sentences[i][0] in ['!', '！', '?', '？', '.']:
-            sentences[i-1] += sentences[i][0]
-            sentences[i] = sentences[i][1:]
+    for i in text:
+        if i == '\n':
+            sentences[0] = '\n'+sentences[0]
+        else:
+            break
     
     text_cuts = []
-    punds_pattern = r'([，,；;：:、~・…]+)'
+    punds_pattern = r'([，,；;：:、~・…]+|[\.。]{2,})'
 
     clauses = []
     for sentence in sentences:
@@ -50,9 +51,10 @@ def cut_text(text, cut_minlen=10):
         else:
             text_cuts.append(current_segment)
 
-    # 确保至少返回一个非空文本段
-    if not text_cuts and text:
-        text_cuts.append(text)
+    for i in range(1, len(text_cuts)):
+        while text_cuts[i][0] in ['!', '！', '?', '？', '.', '。']:
+            text_cuts[i-1] += text_cuts[i][0]
+            text_cuts[i] = text_cuts[i][1:]
 
     return text_cuts
 
@@ -68,7 +70,7 @@ def get_phones_and_bert(texts, tts_config: Config):
     batch_bert = []
     batch_norm_text = []
 
-    bert_tasks = {"pos":[], "norm_text":[], "word2ph":[]}
+    bert_tasks = {"pos":[], "word2ph":[]}
 
     for text in texts:
         segments = LangSegment.getTexts(text)
@@ -86,8 +88,7 @@ def get_phones_and_bert(texts, tts_config: Config):
             word2ph["ph"] += _word2ph["ph"]
             if tts_config.cnroberta and segment['lang'] == "zh":
                 bert_tasks["pos"].append((len(batch_bert) - 1, len(batch_bert[-1])))
-                bert_tasks["norm_text"].append(norm_text)
-                bert_tasks["word2ph"].append(_word2ph["ph"])
+                bert_tasks["word2ph"].append(_word2ph)
                 batch_bert[-1].append(None)
             else:
                 batch_bert[-1].append(torch.zeros((len(phones), 1024), dtype=tts_config.dtype, device=tts_config.device))
@@ -102,19 +103,14 @@ def get_phones_and_bert(texts, tts_config: Config):
         batch_word2ph.append(word2ph)
         batch_norm_text.append(norm_text)
     
-    if bert_tasks["norm_text"] and bert_tasks["word2ph"]:
-        berts = tts_config.cnroberta(bert_tasks["norm_text"], bert_tasks["word2ph"])
+    if bert_tasks["word2ph"]:
+        berts = tts_config.cnroberta(bert_tasks["word2ph"])
         for (i, j), bert in zip(bert_tasks["pos"], berts):
             batch_bert[i][j] = bert
     
-    # 处理空的bert_tensors列表
     processed_batch_bert = []
     for bert_tensors in batch_bert:
-        if len(bert_tensors) > 0:
-            processed_batch_bert.append(torch.cat(bert_tensors))
-        else:
-            # 如果为空，添加一个默认的零张量
-            processed_batch_bert.append(torch.zeros((0, 1024), dtype=tts_config.dtype, device=tts_config.device))
+        processed_batch_bert.append(torch.cat(bert_tensors))
     batch_bert = processed_batch_bert
 
     if is_batch:
