@@ -201,12 +201,9 @@ class Text2SemanticDecoder(nn.Module):
         self.cuda_graph_buckets = {}
     
     @torch.inference_mode()
-    def warmup(self, dtype, device, gpt_cache, compile_mode):
+    def initialize_runtime(self, dtype, device, gpt_cache):
         self.ar_text_position.extend_pe(torch.tensor(0.0, dtype=dtype, device=device).expand(1, 4000))
         self.ar_audio_position.extend_pe(torch.tensor(0.0, dtype=dtype, device=device).expand(1, 4000))
-
-        if compile_mode == "max-optimized":
-            self.t2s_transformer.process_prompt = torch.compile(self.t2s_transformer.process_prompt, mode="default", dynamic=True, fullgraph=True)
 
         for batch_size, max_kv_cache in gpt_cache:
             if batch_size in self.cuda_graph_buckets:
@@ -371,6 +368,7 @@ class Text2SemanticDecoder(nn.Module):
         temperature: float = 1.0,
         repetition_penalty: float = 1.35,
         initial_suppression_steps: int = 10,
+        check_interval: int = 5,
     ):
         xy_pos, prompt_attn_mask = self.process_single_data(x, y, bert_feature)
 
@@ -382,8 +380,6 @@ class Text2SemanticDecoder(nn.Module):
         max_bucket: Bucket = buckets[-1]
 
         max_bucket.kv_cache_len.fill_(0)
-        max_bucket.k_cache.fill_(0)
-        max_bucket.v_cache.fill_(0)
 
         pe_cache = self.ar_audio_position.alpha * self.ar_audio_position.pe
         pe_cache = pe_cache.transpose(0, 1)
@@ -402,13 +398,12 @@ class Text2SemanticDecoder(nn.Module):
             if bucket.kv_cache_len == bucket.max_kv_cache:
                 bucket_i += 1
                 bucket: Bucket = buckets[bucket_i]
-            
-            bucket.graph_xy_pos.copy_(xy_pos)
 
             # 使用 CUDA Graph（如果可用）或普通执行
             if bucket.cuda_graph is not None:
+                bucket.graph_xy_pos.copy_(xy_pos)
                 bucket.cuda_graph.replay()
-                xy_dec = bucket.graph_xy_dec.clone()
+                xy_dec = bucket.graph_xy_dec
             else:
                 xy_dec = self.t2s_transformer.decode_next_token(
                     xy_pos, bucket.k_cache, bucket.v_cache, bucket.kv_cache_len
@@ -418,18 +413,25 @@ class Text2SemanticDecoder(nn.Module):
 
             if idx < initial_suppression_steps:
                 logits[:, self.mute_tokens] = -float("Inf")
-
-            samples = sample(logits, pre_tokens, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
             
-            if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:
-                break
+            samples = sample(logits, pre_tokens, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
 
             pre_tokens = torch.concat([pre_tokens, samples], dim=1)
 
+            if idx % check_interval == 0:
+                if samples[0, 0] == self.EOS:
+                    break
+
             y_emb = self.ar_audio_embedding(samples)
             xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x.shape[1]]
-
-        return pre_tokens[:, -idx:].unsqueeze(0)
+        
+        pre_tokens = pre_tokens[:, -idx:]
+        eos_indices = (pre_tokens == self.EOS).nonzero(as_tuple=True)[1]
+        if eos_indices.numel() > 0:
+            first_eos_idx = eos_indices[0].item()
+            return pre_tokens[:, :first_eos_idx].unsqueeze(0)
+        else:
+            return pre_tokens.unsqueeze(0)
         
     @torch.inference_mode()
     def infer_stream(
@@ -456,8 +458,6 @@ class Text2SemanticDecoder(nn.Module):
         max_bucket: Bucket = buckets[-1]
 
         max_bucket.kv_cache_len.fill_(0)
-        max_bucket.k_cache.fill_(0)
-        max_bucket.v_cache.fill_(0)
 
         pe_cache = self.ar_audio_position.alpha * self.ar_audio_position.pe
         pe_cache = pe_cache.transpose(0, 1)
@@ -478,13 +478,12 @@ class Text2SemanticDecoder(nn.Module):
             if bucket.kv_cache_len == bucket.max_kv_cache:
                 bucket_i += 1
                 bucket: Bucket = buckets[bucket_i]
-            
-            bucket.graph_xy_pos.copy_(xy_pos)
 
             # 使用 CUDA Graph（如果可用）或普通执行
             if bucket.cuda_graph is not None:
+                bucket.graph_xy_pos.copy_(xy_pos)
                 bucket.cuda_graph.replay()
-                xy_dec = bucket.graph_xy_dec.clone()
+                xy_dec = bucket.graph_xy_dec
             else:
                 xy_dec = self.t2s_transformer.decode_next_token(
                     xy_pos, bucket.k_cache, bucket.v_cache, bucket.kv_cache_len
@@ -497,7 +496,7 @@ class Text2SemanticDecoder(nn.Module):
 
             samples = sample(logits, pre_tokens, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
             
-            if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:
+            if samples[0, 0] == self.EOS:
                 break
 
             pre_tokens = torch.concat([pre_tokens, samples], dim=1)
@@ -528,6 +527,7 @@ class Text2SemanticDecoder(nn.Module):
         top_p: int = 1.0,
         temperature: float = 1.0,
         repetition_penalty: float = 1.35,
+        check_interval: int = 5,
     ):
         B, device = len(x), x[0].device
         
@@ -561,8 +561,6 @@ class Text2SemanticDecoder(nn.Module):
         max_bucket: Bucket = buckets[-1]
             
         max_bucket.kv_cache_len.fill_(0)
-        max_bucket.k_cache.fill_(0)
-        max_bucket.v_cache.fill_(0)
 
         current_batch = actual_batch_size
 
@@ -597,12 +595,11 @@ class Text2SemanticDecoder(nn.Module):
             for idx in tqdm(range(1000)):
                 decode_steps += 1
 
-                bucket.graph_xy_pos.copy_(xy_pos)
-
                 # 使用 CUDA Graph（如果可用）或普通执行
                 if bucket.cuda_graph is not None:
+                    bucket.graph_xy_pos.copy_(xy_pos)
                     bucket.cuda_graph.replay()
-                    xy_dec = bucket.graph_xy_dec.clone()
+                    xy_dec = bucket.graph_xy_dec
                 else:
                     xy_dec = self.t2s_transformer.decode_next_token(
                         xy_pos, bucket.k_cache, bucket.v_cache, bucket.kv_cache_len
@@ -612,69 +609,81 @@ class Text2SemanticDecoder(nn.Module):
 
                 samples = sample(logits, pre_tokens, pre_tokens_lens=bucket.kv_cache_len, top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
                 
-                is_reached = bucket.kv_cache_len == bucket.max_kv_cache
-                if is_reached.any():
-                    bucket_i += 1
-                    if bucket_i < len(buckets):
-                        is_reached.fill_(False)
-                        bucket: Bucket = buckets[bucket_i]
-                
-                eos_in_current_step = (torch.argmax(logits, dim=-1) == self.EOS) | (samples[:, 0] == self.EOS) | is_reached
-                finished = (~ignore_batch) & eos_in_current_step
-
-                if finished.any():
-                    finished_indices = torch.where(finished)[0]
-                    for i in finished_indices.tolist():
-                        pred_semantic.append(pre_tokens[i, bucket.kv_cache_len[i]-decode_steps[i] : bucket.kv_cache_len[i]].clone())
-                        semantic_orig_idx.append(batch_orig_idx[i].clone())
-                        decode_steps[i] = 0
-
-                        bucket.kv_cache_len[i].fill_(0)
-                        max_kv_cache_len = bucket.kv_cache_len.max()
-                        for bucket_i in range(len(buckets)):
-                            if buckets[bucket_i].max_kv_cache > max_kv_cache_len:
-                                break
-                        bucket: Bucket = buckets[bucket_i]
-                        
-                        if current_batch == B:
-                            ignore_batch[i] = True
-                            if ignore_batch.all():
-                                stop = True
-                                break
-                        else:
-                            single_x = x[current_batch]
-                            single_y = y[current_batch]
-                            single_bert_feature = bert_feature[current_batch]
-
-                            _xy_pos, prompt_attn_mask = self.process_single_data(
-                                single_x.unsqueeze(0),
-                                single_y.unsqueeze(0),
-                                single_bert_feature.unsqueeze(0),
-                            )
-
-                            xy_dec = self.t2s_transformer.process_prompt(_xy_pos, bucket.k_cache[:, i:i+1], bucket.v_cache[:, i:i+1], bucket.kv_cache_len[i:i+1], prompt_attn_mask)
-                            logits = self.ar_predict_layer(xy_dec[:, -1])
-
-                            x_lens[i].copy_(single_x.shape[0])
-                            bucket.kv_cache_len[i].copy_(single_x.shape[0] + single_y.shape[0])
-                            pre_tokens[i].fill_(0)
-                            pre_tokens[i, :single_y.shape[0]] = single_y
-
-                            new_samples = sample(logits[:, :-1], pre_tokens[i:i+1], top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
-                            samples[i:i+1] = new_samples
-
-                            batch_orig_idx[i] = current_batch
-                            current_batch += 1
-                    
-                    if stop:
-                        break
-                
                 pre_tokens[batch_indices, bucket.kv_cache_len] = samples.squeeze()
+                
+                if idx % check_interval == 0:
+                    is_reached = bucket.kv_cache_len + check_interval >= bucket.max_kv_cache
+                    is_eos_generated = samples[:, 0] == self.EOS
+                    should_stop_seq = is_eos_generated | is_reached
+                    finished = ~ignore_batch & should_stop_seq
+
+                    if finished.any():
+                        if is_reached.any():
+                            bucket_i += 1
+                            if bucket_i < len(buckets):
+                                is_reached.fill_(False)
+                                bucket = buckets[bucket_i]
+                        
+                        should_stop_seq = is_eos_generated | is_reached
+                        finished = ~ignore_batch & should_stop_seq
+
+                        if finished.any():
+                            finished_indices = finished.nonzero(as_tuple=True)[0]
+                            for i in finished_indices:
+                                generated_segment = pre_tokens[i, bucket.kv_cache_len[i]-decode_steps[i] : bucket.kv_cache_len[i]]
+                                eos_indices = (generated_segment == self.EOS).nonzero(as_tuple=True)[0]
+                                if eos_indices.numel() > 0:
+                                    first_eos_idx = eos_indices[0].item()
+                                    generated_segment = generated_segment[:first_eos_idx]
+                                pred_semantic.append(generated_segment.clone())
+                                
+                                semantic_orig_idx.append(batch_orig_idx[i].clone())
+                                decode_steps[i] = 0
+
+                                bucket.kv_cache_len[i].fill_(0)
+                                max_kv_cache_len = bucket.kv_cache_len.max()
+                                for bucket_i in range(len(buckets)):
+                                    if buckets[bucket_i].max_kv_cache > max_kv_cache_len:
+                                        break
+                                bucket: Bucket = buckets[bucket_i]
+                                
+                                if current_batch == B:
+                                    ignore_batch[i] = True
+                                    if ignore_batch.all():
+                                        stop = True
+                                        break
+                                else:
+                                    single_x = x[current_batch]
+                                    single_y = y[current_batch]
+                                    single_bert_feature = bert_feature[current_batch]
+
+                                    _xy_pos, prompt_attn_mask = self.process_single_data(
+                                        single_x.unsqueeze(0),
+                                        single_y.unsqueeze(0),
+                                        single_bert_feature.unsqueeze(0),
+                                    )
+
+                                    xy_dec = self.t2s_transformer.process_prompt(_xy_pos, bucket.k_cache[:, i:i+1], bucket.v_cache[:, i:i+1], bucket.kv_cache_len[i:i+1], prompt_attn_mask)
+                                    logits = self.ar_predict_layer(xy_dec[:, -1])
+
+                                    x_lens[i].copy_(single_x.shape[0])
+                                    bucket.kv_cache_len[i].copy_(single_x.shape[0] + single_y.shape[0])
+                                    pre_tokens[i, :single_y.shape[0]] = single_y
+
+                                    new_samples = sample(logits[:, :-1], single_y.unsqueeze(0), top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty, temperature=temperature)[0]
+                                    samples[i:i+1] = new_samples
+
+                                    batch_orig_idx[i] = current_batch
+                                    current_batch += 1
+                            
+                            if stop:
+                                break
+                
                 y_emb = self.ar_audio_embedding(samples)
                 xy_pos = y_emb * self.ar_audio_position.x_scale + pe_cache[bucket.kv_cache_len-x_lens]
             
             if stop:
                 break
-
+        
         semantic_orig_idx = torch.tensor(semantic_orig_idx, device=device)
         return pred_semantic, semantic_orig_idx

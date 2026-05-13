@@ -19,6 +19,12 @@
       <a href="https://github.com/chinokikiss/GSV-TTS-Lite/stargazers">
         <img src="https://img.shields.io/github/stars/chinokikiss/GSV-TTS-Lite?style=for-the-badge&color=yellow&logo=github" alt="GitHub stars">
       </a>
+      <a href="https://pepy.tech/project/gsv-tts-lite">
+        <img src="https://img.shields.io/pepy/dt/gsv-tts-lite?style=for-the-badge&color=brightgreen" alt="Downloads">
+      </a>
+      <a href="https://deepwiki.com/chinokikiss/GSV-TTS-Lite">
+        <img src="https://img.shields.io/badge/Documentation-DeepWiki-blueviolet.svg?style=for-the-badge&logo=gitbook" alt="Documentation">
+      </a>
   </p>
 
   <p>
@@ -44,13 +50,13 @@
 
 本项目诞生的初衷源于对极致性能的追求。我在原版 GPT-SoVITS 的使用过程中，受限于 RTX 3050 (Laptop) 的算力瓶颈，推理延迟往往难以满足实时交互的需求。
 
-为了打破这一限制，**GSV-TTS-Lite** 应运而生，它是基于 **GPT-SoVITS V2Pro** 开发的推理后端。通过一些深度优化技术，本项目成功在低显存环境下实现了毫秒级的实时响应。
+为了打破这一限制，**GSV-TTS-Lite** 应运而生，它是基于 **GPT-SoVITS (V2/V2Pro/V2ProPlus)** 开发的推理后端。通过一些深度优化技术，本项目成功在低显存环境下实现了毫秒级的实时响应。
 
-除了性能上的飞跃，**GSV-TTS-Lite** 还实现了**音色与风格的解耦**，支持独立控制说话人的音色与情感，并加入了**字幕时间戳对齐**与**音色迁移**等特色功能。
+除了性能上的飞跃，**GSV-TTS-Lite** 还实现了**音色与风格的解耦**，支持独立控制说话人的音色与情感，并加入了**字级时间戳对齐**与**音色迁移**等特色功能。
 
 为了便于开发者集成，**GSV-TTS-Lite** 大幅精简了代码架构，并已作为 `gsv-tts-lite` 库发布至 PyPI，支持通过 `pip` 一键安装。
 
-目前支持的语言有 **中日英**，支持的模型有 **V2Pro**、**V2ProPlus**。
+目前支持的语言有 **中日英**，支持的模型有 **V2**、**V2Pro**、**V2ProPlus**。
 ## 性能对比 (Performance)
 
 > [!NOTE]
@@ -63,31 +69,21 @@
 | **Lite Version** | `Flash_Attn=On` | **133 ms** | **0.108** | **0.8 GB** | 🔥 **3.3x** Speed |
 
 可以看到，**GSV-TTS-Lite** 实现了 **3x ~ 4x** 速度提升，且显存占用 **减半**！🚀
+
+| GPU Model | Throughput (tok/s) | FlashAttention2 |
+| :--- | :---: | :---: |
+| **RTX-PRO-6000** | 1122.72 | Enable |
+| **H200** | 886.47 | Enable |
+| **A100** | 660.73 | Enable |
+| **T4** | 281.06 | Disabled |
+
+**Core optimization technologies:** CUDA Graph, Nested KV Cache, and Continuous Batching.
 <br>
-
-## 整合包下载 (One-click Download)
-
-> [!TIP]
-> 如果你是小白，想要快速体验，可以直接下载预配置好的整合包。
-
-- **硬件要求**：
-  - **操作系统**：仅限 Windows。
-  - **显卡需求**：NVIDIA 显卡，显存需 **4GB** 及以上。
-  - **显存说明**：默认集成了 `Qwen3-ASR` 模型。若显存不足，可在 `go-webui.bat` 中通过参数禁用 ASR 模块以节省空间。
-- **下载地址**：
-  - [推荐版](https://modelscope.cn/models/chinokiki/GPTSoVITS-RT/resolve/master/gsv-tts-lite-web-cu128.zip)
-  - [通用版(兼容旧款 NVIDIA 显卡)](https://modelscope.cn/models/chinokiki/GPTSoVITS-RT/resolve/master/gsv-tts-lite-web-cu118.zip)
-- **使用说明**：
-  1. 下载并解压压缩包（建议路径不要包含中文）。
-  2. 双击运行 `go-webui.bat` 等待网页推理界面跳出。
-  3. 然后就可以开始体验语音合成了！
-  4. 注意！风格参考和音色参考两个都需要上传，少一个都会合成失败！
 
 ## 开发者部署 (Deployment)
 
 ### 环境准备
 
-- **FFmpeg**
 - **CUDA Toolkit**
 > [!IMPORTANT]
 > 当前版本已全面支持 **CUDA**、**MPS (Apple Silicon)** 及 **CPU** 推理后端。
@@ -107,7 +103,7 @@ pip install torch torchvision torchaudio
 #### 2. 安装 GSV-TTS-Lite
 若已准备好上述基础环境，可直接执行以下命令完成集成：
 ```bash 
-pip install gsv-tts-lite==0.3.10
+pip install gsv-tts-lite==0.4.1
 ```
 
 ### WebUI 可视化界面
@@ -172,6 +168,7 @@ audio.play()
 tts.audio_queue.wait()
 # tts.audio_queue.stop() 停止播放
 ```
+https://github.com/user-attachments/assets/72635b40-7287-4318-a5e9-aea93adfabf9
 
 #### 2. 流式推理 / 字幕同步
 ```python
@@ -197,15 +194,13 @@ class SubtitlesQueue:
 
             for subtitle in subtitles:
                 if subtitle["start_s"] > time.time() - last_t:
-                    while time.time() - last_t <= subtitle["start_s"]:
-                        time.sleep(0.01)
+                    time.sleep(subtitle["start_s"] - (time.time() - last_t))
 
                 if subtitle["end_s"] and subtitle["end_s"] > time.time() - last_t:
                     if subtitle["orig_idx_end"] > last_i:
                         print(text[last_i:subtitle["orig_idx_end"]], end="", flush=True)
                         last_i = subtitle["orig_idx_end"]
-                        while time.time() - last_t <= subtitle["end_s"]:
-                            time.sleep(0.01)
+                        time.sleep(subtitle["end_s"] - (time.time() - last_t))
 
         self.t = None
     
@@ -215,9 +210,9 @@ class SubtitlesQueue:
             self.t = threading.Thread(target=self.process, daemon=True)
             self.t.start()
 
-tts = TTS(use_bert=True)
+tts = TTS(use_bert=True, sovits_cache=[50, 55]) # 50 = stream_chunk * 2 = 25 * 2, 55 = stream_chunk * 2 + overlap_len = 25 * 2 + 5
 
-# infer、infer_stream、infer_batched、infer_vc 其实都支持字幕时间戳的返回，这里只是通过 infer_stream 举个例子
+# infer、infer_stream、infer_batched、infer_vc 其实都支持字级时间戳的返回，这里只是通过 infer_stream 举个例子
 subtitlesqueue = SubtitlesQueue()
 
 # infer_stream 实现了 Token 级别的流式输出，显著降低了首字延迟，能够实现极低延迟的实时反馈体验。
@@ -226,6 +221,9 @@ generator = tts.infer_stream(
     prompt_audio_path="examples\AnAn.ogg",
     prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。",
     text="へぇー、ここまでしてくれるんですね。",
+    stream_chunk = 25,
+    overlap_len = 5,
+    return_subtitles=True,
     debug=False,
 )
 
@@ -236,10 +234,18 @@ for audio in generator:
 tts.audio_queue.wait()
 subtitlesqueue.add(None, None)
 ```
+https://github.com/user-attachments/assets/3d2758b3-a283-48b0-960e-a9389dd73129
 
 #### 3. 批量推理
 ```python
 from gsv_tts import TTS
+
+# TTS类参数 gpt_cache: GPT 模型 CUDA graph 的静态缓存配置。
+    # 参数为元组列表 [(batch_size, sequence_length), ...]。
+    # 建议根据实际需求将 batch 和 sequence_length 分段定义，以优化 CUDA 显存利用率及推理性能。
+    # 注意：
+    # 1. 设置的最大 batch_size 决定了该模式下的最大并发吞吐量；
+    # 2. 设置的同一批次下最大 sequence_length 决定了单次生成的最大长度限制。
 
 tts = TTS(use_bert=True)
 
@@ -249,11 +255,14 @@ audios = tts.infer_batched(
     prompt_audio_paths="examples\AnAn.ogg",
     prompt_audio_texts="ちが……ちがう。レイア、貴様は間違っている。",
     texts=["へぇー、ここまでしてくれるんですね。", "The old map crinkled in Leo’s trembling hands."],
+    bert_batch_size=20,
+    sovits_batch_size=10,
 )
 
 for i, audio in enumerate(audios):
     audio.save(f"audio{i}.wav")
 ```
+https://github.com/user-attachments/assets/c2edeb24-b2a8-4360-9d68-8866efbed30c
 
 #### 4. 音色迁移
 ```python
@@ -261,7 +270,7 @@ from gsv_tts import TTS
 
 tts = TTS(use_bert=True, always_load_cnhubert=True)
 
-# infer_vc 虽然支持 Few-shot（少样本）音色迁移，在便捷性上有一定优势，但在转换质量上，相较于 RVC、SVC 等专门的变声模型仍有提升空间。
+# infer_vc 虽然支持 Zero-shot 音色迁移，在便捷性上有一定优势，但在转换质量上，相较于 RVC、SVC 等专门的变声模型仍有提升空间。
 audio = tts.infer_vc(
     spk_audio_path="examples\laffey.mp3",
     prompt_audio_path="examples\AnAn.ogg",
@@ -319,6 +328,17 @@ print("声纹相似度：", similarity)
 
 #### `get_spk_audio_list()` / `get_prompt_audio_list()`
 获取缓存中的音频数据列表。
+
+### 3. 异步调用
+
+#### `infer_async(...)`
+`infer` 方法的异步版本。
+
+#### `infer_stream_async(...)`
+`infer_stream` 方法的异步版本。
+
+#### `infer_batched_async(...)`
+`infer_batched` 方法的异步版本。
 
 </details>
 

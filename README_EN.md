@@ -19,6 +19,12 @@
       <a href="https://github.com/chinokikiss/GSV-TTS-Lite/stargazers">
         <img src="https://img.shields.io/github/stars/chinokikiss/GSV-TTS-Lite?style=for-the-badge&color=yellow&logo=github" alt="GitHub stars">
       </a>
+      <a href="https://pepy.tech/project/gsv-tts-lite">
+        <img src="https://img.shields.io/pepy/dt/gsv-tts-lite?style=for-the-badge&color=brightgreen" alt="Downloads">
+      </a>
+      <a href="https://deepwiki.com/chinokikiss/GSV-TTS-Lite">
+        <img src="https://img.shields.io/badge/Documentation-DeepWiki-blueviolet.svg?style=for-the-badge&logo=gitbook" alt="Documentation">
+      </a>
   </p>
 
   <p>
@@ -44,13 +50,13 @@
 
 The original motivation for this project was the pursuit of ultimate performance. While using the original GPT-SoVITS, I found that the inference latency often struggled to meet the demands of real-time interaction due to the computing power bottlenecks of the RTX 3050 (Laptop).
 
-To break through these limitations, **GSV-TTS-Lite** was developed as an inference backend based on **GPT-SoVITS V2Pro**. Through deep optimization techniques, this project successfully achieves millisecond-level real-time response in low-VRAM environments.
+To break through these limitations, **GSV-TTS-Lite** was developed as an inference backend based on **GPT-SoVITS (V2/V2Pro/V2ProPlus)**. Through deep optimization techniques, this project successfully achieves millisecond-level real-time response in low-VRAM environments.
 
-Beyond the leap in performance, **GSV-TTS-Lite** implements the **decoupling of timbre and style**, supporting independent control over the speaker's voice and emotion. It also features **subtitle timestamp alignment** and **voice conversion (timbre transfer)**.
+Beyond the leap in performance, **GSV-TTS-Lite** implements the **decoupling of timbre and style**, supporting independent control over the speaker's voice and emotion. It also features **character-level timestamps alignment** and **voice conversion (timbre transfer)**.
 
 To facilitate integration for developers, **GSV-TTS-Lite** features a significantly streamlined code architecture and is available on PyPI as the `gsv-tts-lite` library, supporting one-click installation via `pip`.
 
-The currently supported languages are **Chinese, Japanese, and English**. The available models include **v2pro and v2proplus**.
+The currently supported languages are **Chinese, Japanese, and English**. The available models include **V2, V2Pro and V2ProPlus**.
 ## Performance Comparison
 
 > [!NOTE]
@@ -63,13 +69,21 @@ The currently supported languages are **Chinese, Japanese, and English**. The av
 | **Lite Version** | `Flash_Attn=On` | **133 ms** | **0.108** | **0.8 GB** | 🔥 **3.3x** Speed |
 
 As shown, **GSV-TTS-Lite** achieves **3x ~ 4x** speed improvements while **halving** the VRAM usage! 🚀
+
+| GPU Model | Throughput (tok/s) | FlashAttention2 |
+| :--- | :---: | :---: |
+| **RTX-PRO-6000** | 1122.72 | Enable |
+| **H200** | 886.47 | Enable |
+| **A100** | 660.73 | Enable |
+| **T4** | 281.06 | Disabled |
+
+**Core optimization technologies:** CUDA Graph, Nested KV Cache, and Continuous Batching.
 <br>
 
 ## Deployment (For Developers)
 
 ### Prerequisites
 
-- **FFmpeg**
 - **CUDA Toolkit**
 > [!IMPORTANT]
 > The current version provides full support for CUDA, MPS (Apple Silicon), and CPU inference backends.
@@ -89,7 +103,7 @@ pip install torch torchvision torchaudio
 #### 2.	Install GSV-TTS-Lite
 If you have prepared the above basic environment, you can directly execute the following command to complete the integration:
 ```bash 
-pip install gsv-tts-lite==0.3.10
+pip install gsv-tts-lite==0.4.1
 ```
 
 ### WebUI Visual Interface
@@ -155,6 +169,7 @@ audio.play()
 tts.audio_queue.wait()
 # tts.audio_queue.stop() # Stop playback
 ```
+https://github.com/user-attachments/assets/72635b40-7287-4318-a5e9-aea93adfabf9
 
 #### 2. Stream Inference / Subtitle Synchronization
 ```python
@@ -180,15 +195,13 @@ class SubtitlesQueue:
 
             for subtitle in subtitles:
                 if subtitle["start_s"] > time.time() - last_t:
-                    while time.time() - last_t <= subtitle["start_s"]:
-                        time.sleep(0.01)
+                    time.sleep(subtitle["start_s"] - (time.time() - last_t))
 
                 if subtitle["end_s"] and subtitle["end_s"] > time.time() - last_t:
                     if subtitle["orig_idx_end"] > last_i:
                         print(text[last_i:subtitle["orig_idx_end"]], end="", flush=True)
                         last_i = subtitle["orig_idx_end"]
-                        while time.time() - last_t <= subtitle["end_s"]:
-                            time.sleep(0.01)
+                        time.sleep(subtitle["end_s"] - (time.time() - last_t))
 
         self.t = None
     
@@ -198,9 +211,9 @@ class SubtitlesQueue:
             self.t = threading.Thread(target=self.process, daemon=True)
             self.t.start()
 
-tts = TTS()
+tts = TTS(sovits_cache=[50, 55]) # 50 = stream_chunk * 2 = 25 * 2, 55 = stream_chunk * 2 + overlap_len = 25 * 2 + 5
 
-# infer, infer_stream, and infer_batched all support returning subtitle timestamps; infer_stream is used here just as an example.
+# infer, infer_stream, and infer_batched all support returning character-level timestamps; infer_stream is used here just as an example.
 subtitlesqueue = SubtitlesQueue()
 
 # infer_stream implements token-level streaming output, significantly reducing first-token latency and enabling a ultra-low latency real-time feedback experience.
@@ -209,6 +222,9 @@ generator = tts.infer_stream(
     prompt_audio_path="examples\AnAn.ogg",
     prompt_audio_text="ちが……ちがう。レイア、貴様は間違っている。",
     text="へぇー、ここまでしてくれるんですね。",
+    stream_chunk = 25,
+    overlap_len = 5,
+    return_subtitles=True,
     debug=False,
 )
 
@@ -220,10 +236,18 @@ tts.audio_queue.wait()
 subtitlesqueue.add(None, None)
 print()
 ```
+https://github.com/user-attachments/assets/3d2758b3-a283-48b0-960e-a9389dd73129
 
 #### 3. Batched Inference
 ```python
 from gsv_tts import TTS
+
+# TTS parameter gpt_cache: Static cache configuration for the GPT model's CUDA graph.
+    # Expects a list of tuples: [(batch_size, sequence_length), ...].
+    # Defining specific segments for batch_size and sequence_length based on your needs helps optimize CUDA memory usage and inference performance.
+    # Note:
+    # 1. The maximum batch_size determines the maximum throughput for batch processing.
+    # 2. The maximum sequence_length within a batch determines the maximum generation length per request.
 
 tts = TTS()
 
@@ -233,19 +257,22 @@ audios = tts.infer_batched(
     prompt_audio_paths="examples\AnAn.ogg",
     prompt_audio_texts="ちが……ちがう。レイア、貴様は間違っている。",
     texts=["へぇー、ここまでしてくれるんですね。", "The old map crinkled in Leo’s trembling hands."],
+    bert_batch_size=20,
+    sovits_batch_size=10,
 )
 
 for i, audio in enumerate(audios):
     audio.save(f"audio{i}.wav")
 ```
+https://github.com/user-attachments/assets/c2edeb24-b2a8-4360-9d68-8866efbed30c
 
 #### 4. Voice Conversion
 ```python
 from gsv_tts import TTS
 
-tts = TTS()
+tts = TTS(always_load_cnhubert=True)
 
-# Although infer_vc supports few-shot voice conversion and offers convenience, its conversion quality still has room for improvement compared to specialized voice conversion models like RVC or SVC.
+# Although infer_vc supports zero-shot voice conversion and offers convenience, its conversion quality still has room for improvement compared to specialized voice conversion models like RVC or SVC.
 audio = tts.infer_vc(
     spk_audio_path="examples\laffey.mp3",
     prompt_audio_path="examples\AnAn.ogg",
@@ -303,6 +330,17 @@ Remove audio data from the cache.
 
 #### `get_spk_audio_list()` / `get_prompt_audio_list()`
 Get the list of audio data in the cache.
+
+### 3. Asynchronous Invocations
+
+#### `infer_async(...)`
+Asynchronous version of the `infer` method.
+
+#### `infer_stream_async(...)`
+Asynchronous version of the `infer_stream` method.
+
+#### `infer_batched_async(...)`
+Asynchronous version of the `infer_batched` method.
 
 </details>
 

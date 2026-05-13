@@ -5,14 +5,6 @@ import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-
-def _load_audio(path: str) -> "tuple[torch.Tensor, int]":
-    """Load audio using soundfile (no FFmpeg/SoX subprocess required)."""
-    import soundfile as sf
-    data, sr = sf.read(str(path), dtype="float32", always_2d=True)
-    # soundfile returns (samples, channels); torchaudio convention is (channels, samples)
-    return torch.from_numpy(data.T.copy()), sr
-
 # 让 CUDA 算子同步执行，这样才能找到报错位置
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
@@ -23,6 +15,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(filename)s - %(levelname)s: %(message)s'
 )
+import av
 import torchaudio
 import numpy as np
 from tqdm import tqdm
@@ -32,11 +25,10 @@ from torch.nn import functional as F
 from safetensors.torch import save_model
 
 from .Loader import get_gpt_weights, get_sovits_weights, Gpt, Sovits
-from .Download import check_pretrained_models, download_model
+from .Download import check_pretrained_models, download_model, download_cnroberta_int8
 from .TextProcessor import get_phones_and_bert, cut_text, sub2text_index
 from .GPT_SoVITS.Featurizer import CNHubert, CNRoberta
 from .GPT_SoVITS.SV import ERes2Net
-from .GPT_SoVITS.SoVITS.module.mel_processing import spectrogram_torch
 from .GPT_SoVITS.G2P import text_to_phonemes
 from .Player import AudioQueue, AudioClip
 from .Config import Config, global_config
@@ -46,12 +38,11 @@ from .GPT_SoVITS.G2P import Pause
 class TTS:
     def __init__(
         self,
-        gpt_cache: list[tuple[int, int]] = [(1, 512), (1, 1024), (4, 512), (4, 1024)],
-        sovits_cache: list[int] = [50],
+        gpt_cache: list[tuple[int, int]] = [(1, 512), (1, 768), (1, 1024), (4, 512), (4, 1024)],
+        sovits_cache: list[int] = [50, 55],
         models_dir: str = None,
         device: str = None,
         dtype: str = None,
-        compile_mode: Literal[None, "default-optimized", "max-optimized"] = None,
         use_flash_attn: bool = False,
         use_bert: bool = False,
         auto_bert: bool = True,
@@ -68,10 +59,6 @@ class TTS:
             models_dir (str): The directory path containing the pretrained model files.
             device (str): The device to run the model on.
             dtype (str): The data type for model inference (e.g., "float16", "bfloat16", "float32").
-            compile_mode (Literal[None, "default-optimized", "max-optimized"]): Specifies the optimization mode for `torch.compile`. `triton` needs to be installed.
-                - None: Disable compilation.
-                - "default-optimized": Standard inference optimization for SoVITS.
-                - "max-optimized": Full-stack inference optimization for GPT, SoVITS.
             use_flash_attn (bool): Whether to enable Flash Attention for faster inference.
             use_bert (bool): Whether to use BERT for enhanced Chinese semantic understanding. If True, BERT is loaded at initialization.
             auto_bert (bool): Whether to automatically load BERT when Chinese text is detected. Only effective when use_bert=False. Default is True.
@@ -84,6 +71,9 @@ class TTS:
         
         if not device is None:
             self.tts_config.device = torch.device(device)
+            if self.tts_config.device.type in ["mps", "cpu"]:
+                self.tts_config.dtype = torch.float32
+                sovits_cache = []
         if not dtype is None:
             dtype_map = {
                 "float32": torch.float32,
@@ -101,7 +91,6 @@ class TTS:
         self.models_dir = models_dir
         if global_config.models_dir is None: global_config.models_dir = models_dir
         if global_config.use_jieba_fast is None: global_config.use_jieba_fast = use_jieba_fast
-        self.tts_config.compile_mode = compile_mode
         self.tts_config.use_flash_attn = use_flash_attn
         self.tts_config.gpt_cache = gpt_cache
         self.tts_config.sovits_cache = sovits_cache
@@ -109,6 +98,7 @@ class TTS:
         self.gpt_models: dict[str, Gpt] = {}
         self.sovits_models: dict[str, Sovits] = {}
         self.resample_transform_dict = {}
+        self.spectrogram_transform_dict = {}
         self.spk_audio_cache = {}
         self.prompt_audio_cache = {}
 
@@ -122,7 +112,13 @@ class TTS:
         
         self._bert_loaded = False
         if use_bert:
-            if not os.path.exists(self.cnroberta_path):
+            # CPU 场景：下载 INT8 ONNX 模型
+            if self.tts_config.device.type == "cpu":
+                int8_onnx_path = self.cnroberta_path / "cnroberta_int8_dynamic.onnx"
+                if not int8_onnx_path.exists():
+                    download_cnroberta_int8(dir=self.cnroberta_path)
+            # GPU 场景：下载原始 PyTorch 模型
+            elif not os.path.exists(self.cnroberta_path):
                 download_model(
                     filename="chinese-roberta.zip",
                     dir=self.models_dir,
@@ -151,6 +147,7 @@ class TTS:
         prompt_audio_path: str,
         prompt_audio_text: str,
         text: str,
+        return_subtitles: bool = False,
         top_k: int = 15,
         top_p: float = 1.0,
         temperature: float = 1.0,
@@ -170,6 +167,7 @@ class TTS:
             prompt_audio_path (str): Path to the prompt audio file (reference audio for tone/style).
             prompt_audio_text (str): The transcription (text content) of the prompt audio.
             text (str): The target text to be synthesized into speech.
+            return_subtitles (bool, optional): Whether to return subtitle information (timestamps) for the generated audio.
             top_k (int, optional): Sampling parameter for the GPT model. Limits the next token selection to the top K most probable tokens.
             top_p (float, optional): Sampling parameter for the GPT model. Limits the next token selection to a cumulative probability of P.
             temperature (float, optional): Sampling temperature for the GPT model. Higher values make the output more random/expressive; lower values make it more deterministic.
@@ -244,17 +242,21 @@ class TTS:
 
             audio = audio[0, 0, :].float().cpu().numpy()
             assign = self._viterbi_monotonic(attn)
-            subtitles = self._get_subtitles(word2ph, assign, speed)
+            
+            if return_subtitles:
+                subtitles = self._get_subtitles(word2ph, assign, speed)
 
-            if not self._check_pause(subtitles[-1]['text']):
-                subtitles.append({
-                    "text": word2ph['word'][-1],
-                    "start_s": subtitles[-1]['end_s'],
-                    "end_s": subtitles[-1]['end_s']
-                })
-            subtitles[-1]['end_s'] += 0.2
+                if not self._check_pause(subtitles[-1]['text']):
+                    subtitles.append({
+                        "text": word2ph['word'][-1],
+                        "start_s": subtitles[-1]['end_s'],
+                        "end_s": subtitles[-1]['end_s']
+                    })
+                subtitles[-1]['end_s'] += 0.2
 
-            subtitles = sub2text_index(subtitles, norm_text, text)
+                subtitles = sub2text_index(subtitles, norm_text, text)
+            else:
+                subtitles = None
 
             max_audio = np.abs(audio).max()
             if max_audio > 1:
@@ -277,13 +279,14 @@ class TTS:
         prompt_audio_path: str,
         prompt_audio_text: str,
         text: str,
+        return_subtitles: bool = False,
         is_cut_text: bool = True,
         cut_minlen: int = 10,
         cut_mute: int = 0.3,
         cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 0.8, "，": 0.8, ":": 0.8, "：": 0.8, ";": 0.8, "；": 0.8, "~": 0.8, "、": 0.6, "・": 0.6},
         stream_mode: Literal["token", "sentence"] = "token",
         stream_chunk: int = 25,
-        overlap_len: int = 10,
+        overlap_len: int = 5,
         boost_first_chunk: bool = True,
         top_k: int = 15,
         top_p: float = 1.0,
@@ -305,6 +308,7 @@ class TTS:
             prompt_audio_path (str): Path to the prompt audio file (reference audio for tone/style).
             prompt_audio_text (str): The transcription (text content) of the prompt audio.
             text (str): The target text to be synthesized into speech.
+            return_subtitles (bool, optional): Whether to return subtitle information (timestamps) for the generated audio.
             is_cut_text (bool, optional): Whether to split the input text into smaller segments based on punctuation.
             cut_minlen (int, optional): The minimum length of a text segment. Segments shorter than this will be merged.
             cut_mute (float, optional): Duration of silence (in seconds) to insert between text segments.
@@ -424,8 +428,12 @@ class TTS:
                     
                     audio = audio[0, 0, :]
 
-                    assign = self._viterbi_monotonic(attn)
-                    subtitles = self._get_subtitles(word2ph, assign, speed, last_end_s=last_end_s)
+                    if return_subtitles:
+                        assign = self._viterbi_monotonic(attn)
+                        if self._is_normal_assign(assign) or is_final:
+                            subtitles = self._get_subtitles(word2ph, assign, speed, last_end_s=last_end_s)
+                        else:
+                            subtitles = []
 
                     if is_final:
                         if text_cut[-1] in cut_mute_scale_map:
@@ -438,23 +446,27 @@ class TTS:
                         silence = torch.zeros((int(cut_mute * cut_mute_scale * self.samplerate),), dtype=audio.dtype, device=audio.device)
                         audio = torch.concatenate([audio, silence])
 
-                        if not self._check_pause(subtitles[-1]['text']):
-                            subtitles.append({
-                                "text": word2ph['word'][-1],
-                                "start_s": subtitles[-1]['end_s'],
-                                "end_s": subtitles[-1]['end_s']
-                            })
-                        subtitles[-1]['end_s'] += cut_mute * cut_mute_scale
-                        last_end_s = subtitles[-1]['end_s']
+                        if return_subtitles:
+                            if not self._check_pause(subtitles[-1]['text']):
+                                subtitles.append({
+                                    "text": word2ph['word'][-1],
+                                    "start_s": subtitles[-1]['end_s'],
+                                    "end_s": subtitles[-1]['end_s']
+                                })
+                            subtitles[-1]['end_s'] += cut_mute * cut_mute_scale
+                            last_end_s = subtitles[-1]['end_s']
 
-                    if subtitles:
-                        subtitles = sub2text_index(subtitles, norm_text, text_cut)
-                        self._increment_subtitle_indices(subtitles, cur_text_l)
-                        new_subtitles = subtitles[last_subtitles_end:]
-                        last_subtitles_end = len(subtitles)-1
-                        if not is_final and new_subtitles: new_subtitles[-1]['end_s'] = None
+                    if return_subtitles:
+                        if subtitles:
+                            subtitles = sub2text_index(subtitles, norm_text, text_cut)
+                            self._increment_subtitle_indices(subtitles, cur_text_l)
+                            new_subtitles = subtitles[last_subtitles_end:]
+                            last_subtitles_end = len(subtitles)-1
+                            if not is_final and new_subtitles: new_subtitles[-1]['end_s'] = None
+                        else:
+                            new_subtitles = []
                     else:
-                        new_subtitles = []
+                        new_subtitles = None
 
                     audio = audio.float().cpu().numpy()
 
@@ -482,7 +494,7 @@ class TTS:
         return_subtitles: bool = False,
         is_cut_text: bool = True,
         cut_minlen: int = 10,
-        cut_mute: int = 0.3,
+        cut_mute: int = 0.4,
         cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 0.8, "，": 0.8, ":": 0.8, "：": 0.8, ";": 0.8, "；": 0.8, "~": 0.8, "、": 0.6, "・": 0.6},
         top_k: int = 15,
         top_p: float = 1.0,
@@ -541,6 +553,7 @@ class TTS:
             texts = [t if self._check_pause(t) else t + "." for t in texts]
 
             if not is_cut_text: cut_minlen = 10000
+            cut_mute = cut_mute / speed
 
             n = len(texts)
 
@@ -589,14 +602,6 @@ class TTS:
             
             n_orig = len(texts)
             n_segs = len(all_segments)
-            
-            # 处理空文本段的情况
-            if n_segs == 0:
-                # 为每个原始文本添加一个空段
-                for idx, text in enumerate(texts):
-                    all_segments.append(text or " ")
-                    segment_to_original_map.append(idx)
-                n_segs = len(all_segments)
 
             def expand_input(inp):
                 return [inp[segment_to_original_map[i]] for i in range(n_segs)]
@@ -646,19 +651,19 @@ class TTS:
 
                     ge = None
                     for audio_path, weight in spk_audio_path.items():
-                        if audio_path not in self.spk_audio_cache:
-                            self.cache_spk_audio(audio_path)
+                        if (audio_path not in self.spk_audio_cache) or (sovits_model not in self.spk_audio_cache[audio_path]["ge"]):
+                            self.cache_spk_audio(audio_path, sovits_model=sovits_model)
 
                         if ge is None:
-                            ge = self.spk_audio_cache[audio_path]["ge"] * (weight / weight_sum)
+                            ge = self.spk_audio_cache[audio_path]["ge"][sovits_model] * (weight / weight_sum)
                         else:
-                            ge += self.spk_audio_cache[audio_path]["ge"] * (weight / weight_sum)
+                            ge += self.spk_audio_cache[audio_path]["ge"][sovits_model] * (weight / weight_sum)
                 else:
-                    if spk_audio_path not in self.spk_audio_cache:
-                        self.cache_spk_audio(spk_audio_path)
+                    if (spk_audio_path not in self.spk_audio_cache) or (sovits_model not in self.spk_audio_cache[spk_audio_path]["ge"]):
+                        self.cache_spk_audio(spk_audio_path, sovits_model=sovits_model)
 
-                    ge = self.spk_audio_cache[spk_audio_path]["ge"]
-                
+                    ge = self.spk_audio_cache[spk_audio_path]["ge"][sovits_model]
+
                 phoneme_ids = torch.LongTensor(phones1 + phones2).to(self.tts_config.device)
                 bert = torch.cat([bert1, bert2])
                 
@@ -745,7 +750,7 @@ class TTS:
                     assign = self._viterbi_monotonic(attn)
                     subtitles = self._get_subtitles(curr_word2ph, assign, speed)
 
-                    if not self.check_pause(subtitles[-1]['text']):
+                    if not self._check_pause(subtitles[-1]['text']):
                         subtitles.append({
                             "text": curr_word2ph['word'][-1],
                             "start_s": subtitles[-1]['end_s'],
@@ -759,7 +764,7 @@ class TTS:
                 if return_subtitles:
                     last_i = 0
                     for j in range(len(semantic_list)):
-                        best_i = self._find_subtitles_by_text(subtitles, all_norm_text[curr_orig_indices[j]], last_i)
+                        best_i = self._find_subtitles(subtitles, all_word2ph[curr_orig_indices[j]], last_i)
                         subtitle = subtitles[last_i:best_i]
                         last_i = best_i
                         
@@ -821,7 +826,7 @@ class TTS:
                     cut_mute_scale = cut_mute_scale_map["…"]
                 else:
                     cut_mute_scale = 1.0
-                silence = np.zeros((int(cut_mute * cut_mute_scale * self.samplerate),))
+                silence = np.zeros((int(cut_mute * cut_mute_scale * self.samplerate),), dtype=audio_data.dtype)
                 final_ordered_audios[orig_idx].append(silence)
 
                 if return_subtitles:
@@ -953,6 +958,7 @@ class TTS:
         prompt_audio_path: str,
         prompt_audio_text: str,
         text: str,
+        return_subtitles: bool = False,
         top_k: int = 15,
         top_p: float = 1.0,
         temperature: float = 1.0,
@@ -978,10 +984,11 @@ class TTS:
         def _infer_with_lock():
             with self._infer_lock:
                 return self.infer(
-                    spk_audio_path,
-                    prompt_audio_path,
-                    prompt_audio_text,
-                    text,
+                    spk_audio_path=spk_audio_path,
+                    prompt_audio_path=prompt_audio_path,
+                    prompt_audio_text=prompt_audio_text,
+                    text=text,
+                    return_subtitles=return_subtitles,
                     top_k=top_k,
                     top_p=top_p,
                     temperature=temperature,
@@ -997,6 +1004,88 @@ class TTS:
         else:
             return await loop.run_in_executor(executor, _infer_with_lock)
     
+    async def infer_stream_async(
+        self,
+        spk_audio_path: str | dict,
+        prompt_audio_path: str,
+        prompt_audio_text: str,
+        text: str,
+        return_subtitles: bool = False,
+        is_cut_text: bool = True,
+        cut_minlen: int = 10,
+        cut_mute: int = 0.3,
+        cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 0.8, "，": 0.8, ":": 0.8, "：": 0.8, ";": 0.8, "；": 0.8, "~": 0.8, "、": 0.6, "・": 0.6},
+        stream_mode: Literal["token", "sentence"] = "token",
+        stream_chunk: int = 25,
+        overlap_len: int = 5,
+        boost_first_chunk: bool = True,
+        top_k: int = 15,
+        top_p: float = 1.0,
+        temperature: float = 1.0,
+        repetition_penalty: float = 1.35,
+        noise_scale: float = 0.5,
+        speed: float = 1.0,
+        gpt_model: str = None,
+        sovits_model: str = None,
+        debug: bool = True,
+        executor: ThreadPoolExecutor = None,
+    ):
+        """
+        Asynchronous version of the infer_stream method, allowing streaming results 
+        to be yielded in an async context.
+
+        Args:
+            Parameters are identical to the 'infer_stream' method.
+            executor: Optional ThreadPoolExecutor. If not provided, the default executor will be used.
+            
+        Returns:
+            AudioClip: Same return type as the 'infer_stream' method.
+        """
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue()
+
+        def _stream_wrapper():
+            try:
+                with self._infer_lock:
+                    for chunk in self.infer_stream(
+                        spk_audio_path=spk_audio_path,
+                        prompt_audio_path=prompt_audio_path,
+                        prompt_audio_text=prompt_audio_text,
+                        text=text,
+                        return_subtitles=return_subtitles,
+                        is_cut_text=is_cut_text,
+                        cut_minlen=cut_minlen,
+                        cut_mute=cut_mute,
+                        cut_mute_scale_map=cut_mute_scale_map,
+                        stream_mode=stream_mode,
+                        stream_chunk=stream_chunk,
+                        overlap_len=overlap_len,
+                        boost_first_chunk=boost_first_chunk,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                        noise_scale=noise_scale,
+                        speed=speed,
+                        gpt_model=gpt_model,
+                        sovits_model=sovits_model,
+                        debug=debug
+                    ):
+                        loop.call_soon_threadsafe(queue.put_nowait, chunk)
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        if executor is None:
+            loop.run_in_executor(None, _stream_wrapper)
+        else:
+            loop.run_in_executor(executor, _stream_wrapper)
+
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            yield chunk
+    
     async def infer_batched_async(
         self,
         spk_audio_paths: str | dict | list[str | dict],
@@ -1006,7 +1095,7 @@ class TTS:
         return_subtitles: bool = False,
         is_cut_text: bool = True,
         cut_minlen: int = 10,
-        cut_mute: int = 0.3,
+        cut_mute: int = 0.4,
         cut_mute_scale_map: dict = {"…": 2.0, ".": 1.5, "。": 1.5, "?": 1.5, "？": 1.5, "!": 1.5, "！": 1.5, ",": 0.8, "，": 0.8, ":": 0.8, "：": 0.8, ";": 0.8, "；": 0.8, "~": 0.8, "、": 0.6, "・": 0.6},
         top_k: int = 15,
         top_p: float = 1.0,
@@ -1014,6 +1103,8 @@ class TTS:
         repetition_penalty: float = 1.35,
         noise_scale: float = 0.5,
         speed: float = 1.0,
+        bert_batch_size: int = 20,
+        sovits_batch_size: int = 10,
         gpt_model: str = None,
         sovits_model: str = None,
         executor: ThreadPoolExecutor = None,
@@ -1033,10 +1124,10 @@ class TTS:
         def _infer_batched_with_lock():
             with self._infer_lock:
                 return self.infer_batched(
-                    spk_audio_paths,
-                    prompt_audio_paths,
-                    prompt_audio_texts,
-                    texts,
+                    spk_audio_paths=spk_audio_paths,
+                    prompt_audio_paths=prompt_audio_paths,
+                    prompt_audio_texts=prompt_audio_texts,
+                    texts=texts,
                     return_subtitles=return_subtitles,
                     is_cut_text=is_cut_text,
                     cut_minlen=cut_minlen,
@@ -1048,6 +1139,8 @@ class TTS:
                     repetition_penalty=repetition_penalty,
                     noise_scale=noise_scale,
                     speed=speed,
+                    bert_batch_size=bert_batch_size,
+                    sovits_batch_size=sovits_batch_size,
                     gpt_model=gpt_model,
                     sovits_model=sovits_model,
                 )
@@ -1081,18 +1174,18 @@ class TTS:
 
             ge = None
             for audio_path, weight in spk_audio_path.items():
-                if audio_path not in self.spk_audio_cache:
-                    self.cache_spk_audio(audio_path)
+                if (audio_path not in self.spk_audio_cache) or (sovits_model not in self.spk_audio_cache[audio_path]["ge"]):
+                    self.cache_spk_audio(audio_path, sovits_model=sovits_model)
 
                 if ge is None:
-                    ge = self.spk_audio_cache[audio_path]["ge"] * (weight / weight_sum)
+                    ge = self.spk_audio_cache[audio_path]["ge"][sovits_model] * (weight / weight_sum)
                 else:
-                    ge += self.spk_audio_cache[audio_path]["ge"] * (weight / weight_sum)
+                    ge += self.spk_audio_cache[audio_path]["ge"][sovits_model] * (weight / weight_sum)
         else:
-            if spk_audio_path not in self.spk_audio_cache:
-                self.cache_spk_audio(spk_audio_path)
+            if (spk_audio_path not in self.spk_audio_cache) or (sovits_model not in self.spk_audio_cache[spk_audio_path]["ge"]):
+                self.cache_spk_audio(spk_audio_path, sovits_model=sovits_model)
 
-            ge = self.spk_audio_cache[spk_audio_path]["ge"]
+            ge = self.spk_audio_cache[spk_audio_path]["ge"][sovits_model]
 
         sovits = self.sovits_models[sovits_model]
 
@@ -1211,6 +1304,9 @@ class TTS:
             for model_path in model_paths:
                 if model_path in self.sovits_models:
                     del self.sovits_models[model_path]
+                    for audio in self.spk_audio_cache.values():
+                        if model_path in audio["ge"]:
+                            del audio["ge"][model_path]
                     logging.info(f'Unloaded SoVITS model: {model_path}')
                 else:
                     logging.warning(f'SoVITS model {model_path} not found.')
@@ -1236,7 +1332,7 @@ class TTS:
         return list(self.sovits_models.keys())
     
     @torch.inference_mode()
-    def cache_spk_audio(self, *spk_audio_paths: str):
+    def cache_spk_audio(self, *spk_audio_paths: str, sovits_model:str=None):
         """
         Processes and caches speaker audio embeddings for voice cloning.
 
@@ -1248,21 +1344,32 @@ class TTS:
                 logging.error('No SoVITS models are currently loaded! Cannot cache speaker audio.')
                 return
 
-            model = self.sovits_models[next(iter(self.sovits_models))]
+            if sovits_model is None:
+                sovits_model = next(iter(self.sovits_models))
+
+            if sovits_model not in self.sovits_models:
+                logging.error(f'The SoVITS model {sovits_model} is not currently loaded! Cannot cache speaker audio.')
+                return
+
+            model = self.sovits_models[sovits_model]
 
             if self.sv_model is None:
                 self.sv_model = ERes2Net(self.sv_path, self.tts_config)
 
             for spk_audio_path in spk_audio_paths:
                 refers, audio_tensor = self._get_spec(model.hps, spk_audio_path)
-                sv_emb = self.sv_model.compute_embedding3(audio_tensor)
-                ge = model.vq_model.get_ge(refers, sv_emb)
-                self.spk_audio_cache[spk_audio_path] = {
-                    "ge": ge, 
-                    "sv_emb": sv_emb
-                }
+                if spk_audio_path not in self.spk_audio_cache:
+                    sv_emb = self.sv_model.compute_embedding3(audio_tensor)
+                    ge = model.vq_model.get_ge(refers, sv_emb)
+                    self.spk_audio_cache[spk_audio_path] = {
+                        "ge": {sovits_model: ge},
+                        "sv_emb": sv_emb,
+                    }
+                elif sovits_model not in self.spk_audio_cache[spk_audio_path]["ge"]:
+                    ge = model.vq_model.get_ge(refers, self.spk_audio_cache[spk_audio_path]["sv_emb"])
+                    self.spk_audio_cache[spk_audio_path]["ge"][sovits_model] = ge
                 logging.info(f'Cached speaker audio: {spk_audio_path}')
-            
+
             if not self.always_load_sv:
                 self.sv_model = None
 
@@ -1412,7 +1519,13 @@ class TTS:
             return
         if not self.auto_bert:
             return
-        if not os.path.exists(self.cnroberta_path):
+        # CPU 场景：下载 INT8 ONNX 模型
+        if self.tts_config.device.type == "cpu":
+            int8_onnx_path = self.cnroberta_path / "cnroberta_int8_dynamic.onnx"
+            if not int8_onnx_path.exists():
+                download_cnroberta_int8(dir=self.cnroberta_path)
+        # GPU 场景：下载原始 PyTorch 模型
+        elif not os.path.exists(self.cnroberta_path):
             download_model(
                 filename="chinese-roberta.zip",
                 dir=self.models_dir,
@@ -1425,7 +1538,7 @@ class TTS:
         return text.endswith(self.punctuation) or text[-3:] in ["...", "。。。"]
     
     def _get_prompt(self, cnhubert_model: CNHubert, sovits_model: Sovits, audio_path: str):
-        wav, sr = _load_audio(audio_path)
+        wav, sr = self._load_audio(audio_path)
         wav = wav.to(self.tts_config.device)
 
         wav16k = self._resample(wav, sr, 16000).mean(dim=0)
@@ -1452,7 +1565,7 @@ class TTS:
     
     def _get_spec(self, hps, filename):
         sr1 = int(hps.data.sampling_rate)
-        audio, sr0 = _load_audio(filename)
+        audio, sr0 = self._load_audio(filename)
 
         audio = audio.to(self.tts_config.device).float()
         if audio.shape[0] == 2:
@@ -1464,16 +1577,21 @@ class TTS:
         if maxx > 1:
             audio /= min(2, maxx)
 
-        spec = spectrogram_torch(
-            audio,
-            hps.data.filter_length,
-            hps.data.sampling_rate,
-            hps.data.hop_length,
-            hps.data.win_length,
-            center=False,
-        )
+        key = "%s-%s-%s" % (hps.data.filter_length, hps.data.hop_length, hps.data.win_length)
+        if key not in self.spectrogram_transform_dict:
+            self.spectrogram_transform_dict[key] = torchaudio.transforms.Spectrogram(
+                n_fft=hps.data.filter_length,
+                win_length=hps.data.win_length,
+                hop_length=hps.data.hop_length,
+                center=True,
+                pad_mode="reflect",
+                power=1.0,
+            ).to(self.tts_config.device)
+        spectrogram_torch = self.spectrogram_transform_dict[key]
 
+        spec = spectrogram_torch(audio)
         spec = spec.to(self.tts_config.dtype)
+
         audio = self._resample(audio, sr1, 16000)
         audio = audio.to(self.tts_config.dtype)
 
@@ -1496,7 +1614,7 @@ class TTS:
         f2_real = torch.cat([f_faded, f2_aligned[:, :, overlap_len:]], dim=-1)
         return f2_real, offset
     
-    def _find_quietest_offsets(self, audio, frame_length=512, hop_length=256, search_len=6400):
+    def _find_quietest_offsets(self, audio, frame_length=512, hop_length=256, search_len=12800):
         search_audio = audio[:search_len]
         frames = search_audio.unfold(0, frame_length, hop_length)
         rms_values = torch.sqrt(torch.mean(frames**2, dim=1))
@@ -1505,7 +1623,7 @@ class TTS:
         
         return head_offset
     
-    def _find_head_threshold_offsets(self, audio, threshold=0.02, frame_length=512, hop_length=256, search_len=32000):
+    def _find_head_threshold_offsets(self, audio, threshold=0.02, frame_length=512, hop_length=256, search_len=64000):
         threshold = threshold * audio.max()
 
         search_audio_head = audio[:search_len]
@@ -1523,10 +1641,12 @@ class TTS:
             
         return head_offset
 
-    def _find_tail_threshold_offsets(self, audio, threshold=0.02, frame_length=512, hop_length=256, search_len=32000):
+    def _find_tail_threshold_offsets(self, audio, threshold=0.02, frame_length=512, hop_length=256, search_len=64000):
         threshold = threshold * audio.max()
 
         search_audio_tail = audio[-search_len:]
+        actual_len = search_audio_tail.shape[0]
+        
         frames_tail = search_audio_tail.unfold(0, frame_length, hop_length)
         rms_tail = torch.sqrt(torch.mean(frames_tail**2, dim=1))
         
@@ -1535,13 +1655,13 @@ class TTS:
         
         if tail_indices.numel() > 0:
             tail_frame_idx = tail_indices[-1].item()
-            tail_offset = search_len - (tail_frame_idx * hop_length)
+            tail_offset = actual_len - (tail_frame_idx * hop_length)
         else:
             tail_offset = 1
             
         return tail_offset
     
-    def _fade(self, audio, fade_len=3200):
+    def _fade(self, audio, fade_len=1600):
         audio = audio.clone()
         fade_in_vec = torch.linspace(0, 1, fade_len, device=audio.device)
         fade_out_vec = torch.linspace(1, 0, fade_len, device=audio.device)
@@ -1595,19 +1715,16 @@ class TTS:
         
         return subtitles
 
-    def _find_subtitles_by_text(self, subtitles, text, last_i):
-        text = text.replace(" ", "")
-        m = 0
-        for i in range(last_i, len(subtitles)):
-            subtitle = subtitles[i]
-            if subtitle["text"] == text[m:m+len(subtitle["text"])]:
-                m += len(subtitle["text"])
-            else:
+    def _find_subtitles(self, subtitles, word2ph, last_i):
+        target_seq = " ".join(word2ph["word"])
+        w = len(word2ph["word"])
+        for i in range(last_i, len(subtitles)-w+1):
+            sub_text = " ".join([subtitle["text"] for subtitle in subtitles[i:i+w]])
+            if sub_text == target_seq:
                 break
         else:
-            i = len(subtitles)
-        
-        return i
+            i = len(subtitles)-w
+        return i+w
     
     def _cat_subtitles(self, *subtitles_list):
         last_end_s = 0
@@ -1682,12 +1799,38 @@ class TTS:
 
         return assign_path
     
+    def _is_normal_assign(self, assign, threshold=0.5):
+        x = assign[assign != -1]
+        
+        if len(x) == 0:
+            return False
+
+        _, counts = torch.unique_consecutive(x, return_counts=True)
+        singletons = (counts == 1).sum().float()
+        ratio = singletons / len(counts)
+
+        return ratio < threshold
+    
+    def _load_audio(self, audio_path):
+        # 摆脱FFmpeg繁琐的手动安装
+        with av.open(audio_path) as container:
+            stream = container.streams.audio[0]
+            resampler = av.AudioResampler(format='flt', layout='mono', rate=stream.rate)
+            
+            frames = []
+            for frame in container.decode(stream):
+                for resampled_frame in resampler.resample(frame):
+                    frames.append(resampled_frame.to_ndarray())
+                    
+            audio_data = np.concatenate(frames, axis=1)
+            return torch.from_numpy(audio_data), stream.rate
+    
     def _empty_cache(self):
         try:
             gc.collect()
-            if self.tts_config.device_type == "cuda":
+            if self.tts_config.device.type == "cuda":
                 torch.cuda.empty_cache()
-            elif self.tts_config.device_type == "mps":
+            elif self.tts_config.device.type == "mps":
                 torch.mps.empty_cache()
         except:
             pass
