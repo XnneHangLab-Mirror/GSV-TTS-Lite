@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 def _load_audio(path: str) -> "tuple[torch.Tensor, int]":
     """Load audio using soundfile (no FFmpeg/SoX subprocess required)."""
     import soundfile as sf
+    import torch
+
     data, sr = sf.read(str(path), dtype="float32", always_2d=True)
     # soundfile returns (samples, channels); torchaudio convention is (channels, samples)
     return torch.from_numpy(data.T.copy()), sr
